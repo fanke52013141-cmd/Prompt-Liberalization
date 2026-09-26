@@ -1,4 +1,4 @@
-# 提示词优化实验室 · Windows 本机启动脚本
+﻿# 提示词优化实验室 · Windows 本机启动脚本
 # 用法： powershell -ExecutionPolicy Bypass -File scripts\start.ps1 [-Port 8620]
 param(
     [int]$Port = 8620

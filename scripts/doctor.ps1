@@ -1,4 +1,4 @@
-# 诊断脚本：环境/数据/一致性检查（对应 PRD P14 doctor 能力）
+﻿# 诊断脚本：环境/数据/一致性检查（对应 PRD P14 doctor 能力）
 $root = Split-Path -Parent $PSScriptRoot
 Write-Host "== 提示词优化实验室 诊断 ==" -ForegroundColor Cyan
 
@@ -10,17 +10,19 @@ if ($ok) { Write-Host "依赖          : $ok" } else { Write-Host "依赖       
 $db = Join-Path $root "data\prompt_lab.db"
 if (Test-Path $db) {
     Write-Host "数据库        : $db ($([math]::Round((Get-Item $db).Length/1KB,1)) KB)"
-    & python -c @"
-import sqlite3, sys
-conn = sqlite3.connect(r'$db')
+    $env:PL_DB = $db
+    & python -c @'
+import sqlite3, os
+conn = sqlite3.connect(os.environ['PL_DB'])
 counts = {}
-for t in ('projects','dataset_items','outputs','runs','ledger','acceptance_reports','releases','feedback'):
-    counts[t] = conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+for t in ('projects', 'dataset_items', 'outputs', 'runs', 'ledger',
+          'acceptance_reports', 'releases', 'feedback'):
+    counts[t] = conn.execute('SELECT COUNT(*) FROM ' + t).fetchone()[0]
 for k, v in counts.items():
-    print(f'  {k:20s} {v}')
-bad = conn.execute('SELECT COUNT(*) FROM ledger WHERE status=''reserved''').fetchone()[0]
-print(f'  在途预留(应随运行结束归零或保留为sent_unknown): {bad}')
-"@
+    print('  %-20s %d' % (k, v))
+bad = conn.execute('SELECT COUNT(*) FROM ledger WHERE status=?', ('reserved',)).fetchone()[0]
+print('  reserved_in_flight (0 after runs settle): %d' % bad)
+'@
 } else {
     Write-Host "数据库        : 尚未创建（首次启动后生成）" -ForegroundColor Yellow
 }

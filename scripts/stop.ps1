@@ -1,4 +1,4 @@
-# 停止服务：只停进程，不删除任何数据/数据库文件（TC054：停止不删卷）
+﻿# 停止服务：只停进程，不删除任何数据/数据库文件（TC054：停止不删卷）
 $root = Split-Path -Parent $PSScriptRoot
 $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -like "*run_server.py*" }

@@ -1,4 +1,4 @@
-# 备份脚本：备份业务数据库与配置（本地单机版的全量恢复点）
+﻿# 备份脚本：备份业务数据库与配置（本地单机版的全量恢复点）
 # 恢复：把 backups\<timestamp> 中的文件复制回 data\ 后重启服务
 param([string]$Target = "")
 $root = Split-Path -Parent $PSScriptRoot
