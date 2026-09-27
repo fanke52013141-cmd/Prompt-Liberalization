@@ -158,10 +158,69 @@ CREATE TABLE IF NOT EXISTS run_events (
   type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
   UNIQUE(run_id, seq)
 );
+CREATE TABLE IF NOT EXISTS tags (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+  definition TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+  merged_into TEXT DEFAULT '', created_at TEXT NOT NULL,
+  UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS expert_feedback (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, item_id TEXT NOT NULL DEFAULT '',
+  quote TEXT DEFAULT '',                           -- 专家原话/引用（保留原文）
+  problem TEXT NOT NULL,                           -- 问题描述及适用条件
+  expected TEXT DEFAULT '',                        -- 期望表现
+  check_method TEXT DEFAULT '',                    -- 检查方式
+  severity TEXT NOT NULL DEFAULT 'normal',         -- severe/normal/preference
+  status TEXT NOT NULL DEFAULT 'pending',          -- pending/confirmed_error/preference/unverified/resolved/retired
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  remark TEXT DEFAULT '',                          -- 专家备注原文（系统不得摘要覆盖）
+  source TEXT NOT NULL DEFAULT 'manual',           -- manual/import
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rating_rules (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version_no INTEGER NOT NULL,
+  levels_json TEXT NOT NULL,                       -- [{code,name,trend,meaning,display_basis}]
+  status TEXT NOT NULL DEFAULT 'draft',            -- draft/published
+  note TEXT DEFAULT '', hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(project_id, version_no)
+);
+CREATE TABLE IF NOT EXISTS case_reviews (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, item_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL, rating TEXT NOT NULL,     -- 等级码 / cannot_judge / not_rated
+  resolutions_json TEXT NOT NULL DEFAULT '[]',     -- [{feedback_id,status,note}] fixed/partial/open/unknown
+  new_problems_json TEXT NOT NULL DEFAULT '[]',    -- [{description,severity}]
+  regress_note TEXT DEFAULT '', remark TEXT DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'human',            -- human/auto_suggested/human_confirmed/human_corrected
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_rounds (
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round_no INTEGER NOT NULL,
+  hypothesis TEXT DEFAULT '', problem_evidence_json TEXT NOT NULL DEFAULT '[]',
+  prompt_version_id TEXT DEFAULT '', score REAL, prev_score REAL,
+  usable_rate REAL, severe INTEGER, regressions INTEGER DEFAULT 0,
+  fixed_problems_json TEXT NOT NULL DEFAULT '[]',
+  decision TEXT DEFAULT '', rationale TEXT DEFAULT '', next_direction TEXT DEFAULT '',
+  length_chars INTEGER DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'scored',           -- scored/rewrite_failed/no_change
+  detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+  UNIQUE(run_id, round_no)
+);
 CREATE INDEX IF NOT EXISTS idx_items_proj ON dataset_items(project_id, split);
 CREATE INDEX IF NOT EXISTS idx_outputs_item ON outputs(item_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_run ON ledger(run_id);
 """
+
+
+# 旧库平滑迁移：缺列补列（历史数据与新配置共存，不覆盖旧结果——优化1.0 §13 历史兼容）
+_MIGRATIONS = (
+    ("runs", "baseline_detail_json",
+     "ALTER TABLE runs ADD COLUMN baseline_detail_json TEXT NOT NULL DEFAULT '{}'"),
+    ("runs", "round_no", "ALTER TABLE runs ADD COLUMN round_no INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "current_best_pv", "ALTER TABLE runs ADD COLUMN current_best_pv TEXT DEFAULT ''"),
+    ("runs", "best_detail_json",
+     "ALTER TABLE runs ADD COLUMN best_detail_json TEXT NOT NULL DEFAULT '{}'"),
+    ("runs", "stall_count", "ALTER TABLE runs ADD COLUMN stall_count INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 class DB:
@@ -173,6 +232,10 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            for table, col, ddl in _MIGRATIONS:
+                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if col not in cols:
+                    self._conn.execute(ddl)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.commit()
 

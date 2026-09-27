@@ -171,7 +171,8 @@ TASK_TEMPLATES = {
 def template_draft(task_type: str) -> dict:
     """返回任务的契约与评价标准草案（可编辑初始化建议）。"""
     if task_type not in TASK_TEMPLATES:
-        raise BizError("TASK_TYPE_UNKNOWN", f"未知任务类型：{task_type}，可选：{list(TASK_TEMPLATES)}")
+        raise BizError("TASK_TYPE_UNKNOWN", f"未知任务类型：{task_type}，可选：{list(TASK_TEMPLATES)}"
+                       "；自定义任务请直接提供 contract 字段（模板仅作为可选示例，不是边界）")
     t = TASK_TEMPLATES[task_type]
     return {
         "task_type": task_type,
@@ -183,3 +184,103 @@ def template_draft(task_type: str) -> dict:
         "primary_metric": t["primary_metric"],
         "is_demo": True,  # PRD P01：模板中示例明确为演示数据
     }
+
+
+# ---------------------------------------------------------------- 自定义任务契约（优化1.0 §3.2）
+
+CUSTOM_TYPE = "custom"
+_FIELD_TYPES = ("text", "enum", "integer", "number")
+# 字段名会用于 {{字段名}} 模板占位：禁止与占位语法/分隔符冲突的字符
+_FIELD_NAME_FORBIDDEN = set("{}\"'，,：:")
+
+
+def _check_field_name(name: str, field: str) -> None:
+    bad = [ch for ch in name if ch in _FIELD_NAME_FORBIDDEN]
+    if bad:
+        raise BizError("CONTRACT_INVALID", f"字段名 {name} 含有不允许的字符：{''.join(bad)}",
+                       field_errors={field: "字段名不能包含 { } 引号 逗号 冒号"})
+
+
+def normalize_custom_contract(contract: dict) -> dict:
+    """把用户自定义契约规范化：字段名合法、运行时/评价字段不相交（BR01 的前提）。
+
+    任务模板只是可选示例，用户自由定义任务；这里只做结构性校验，
+    不把任何业务模板字段强加给用户。
+    """
+    if not isinstance(contract, dict):
+        raise BizError("CONTRACT_INVALID", "自定义契约必须是对象")
+    runtime = contract.get("runtime_fields") or []
+    evaluation = contract.get("evaluation_fields") or []
+    if not runtime:
+        raise BizError("CONTRACT_INVALID",
+                       "至少需要一个运行时输入字段（执行模型可见的输入，BR01）")
+    seen: set = set()
+    for i, f in enumerate(runtime):
+        name = str(f.get("name") or "").strip()
+        if not name:
+            raise BizError("CONTRACT_INVALID", f"runtime_fields[{i}] 缺少字段名",
+                           field_errors={f"runtime_fields[{i}].name": "必填"})
+        _check_field_name(name, f"runtime_fields[{i}].name")
+        if not name or name in seen:
+            raise BizError("CONTRACT_INVALID", f"运行时字段名重复或非法：{name}",
+                           field_errors={f"runtime_fields[{i}].name": "重复"})
+        seen.add(name)
+        if f.get("type") and f["type"] not in _FIELD_TYPES:
+            raise BizError("CONTRACT_INVALID", f"字段 {name} 类型非法：{f.get('type')}",
+                           field_errors={f"runtime_fields[{i}].type": "text/enum/integer/number"})
+    eval_names: set = set()
+    for i, f in enumerate(evaluation):
+        name = str(f.get("name") or "").strip()
+        if not name:
+            raise BizError("CONTRACT_INVALID", f"evaluation_fields[{i}] 缺少字段名")
+        _check_field_name(name, f"evaluation_fields[{i}].name")
+        if name in seen or name in eval_names:
+            raise BizError("CONTRACT_INVALID",
+                           f"评价字段 {name} 与运行时字段重名：评价专用信息不能进入生成请求（BR01）",
+                           field_errors={f"evaluation_fields[{i}].name": "与运行时字段重名"})
+        eval_names.add(name)
+    return {
+        "task_type": contract.get("task_type") or CUSTOM_TYPE,
+        "label": contract.get("label") or contract.get("task_label") or "自定义任务",
+        "goal": (contract.get("goal") or "").strip(),
+        "runtime_fields": [{"name": f["name"], "type": f.get("type") or "text",
+                            "label": f.get("label") or f["name"],
+                            "required": bool(f.get("required", True)),
+                            **({"options": f["options"]} if f.get("options") else {})}
+                           for f in runtime],
+        "evaluation_fields": [{"name": f["name"], "type": f.get("type") or "text",
+                               "label": f.get("label") or f["name"],
+                               "required": bool(f.get("required", False))}
+                              for f in evaluation],
+        "evaluation_unit": contract.get("evaluation_unit") or "一份完整输出",
+        "primary_metric": contract.get("primary_metric") or "可直接使用的输出比例",
+        "dimensions": contract.get("dimensions") or [],
+        "severity_examples": contract.get("severity_examples") or [],
+        "acceptance_policy": contract.get("acceptance_policy") or {
+            "primary_metric": contract.get("primary_metric") or "可直接使用的输出比例",
+            "min_observed_improvement": 0.05,
+            "ci_rule": "lower_bound_gt_zero",
+            "severe_error_gate": True,
+        },
+        "is_demo": bool(contract.get("is_demo", False)),
+    }
+
+
+# ---------------------------------------------------------------- ABCD 评级默认草案（优化1.0 §6.5）
+
+DEFAULT_ABCD_LEVELS = [
+    {"code": "A", "name": "原错误全部避免", "trend": "improved",
+     "meaning": "专家原问题全部解决",
+     "display_basis": "逐项解决情况及新增问题检查"},
+    {"code": "B", "name": "部分避免", "trend": "partial",
+     "meaning": "解决了部分原问题",
+     "display_basis": "已解决和仍存在的具体问题"},
+    {"code": "C", "name": "没有避免", "trend": "none",
+     "meaning": "原问题仍然存在",
+     "display_basis": "原问题仍然存在的证据"},
+    {"code": "D", "name": "出现更多问题或明显退步", "trend": "worse",
+     "meaning": "出现新增问题或原有能力退步",
+     "display_basis": "新增、回退问题及影响"},
+]
+RATING_SPECIAL = ("cannot_judge", "not_rated")  # 无法判断 / 尚未评价：单独记录，不并入等级
+RESOLUTION_STATES = ("fixed", "partial", "open", "unknown")  # 完全解决/部分解决/未解决/无法判断

@@ -6,8 +6,8 @@ import threading
 
 from .core import BizError, canonical_hash, new_id, now_iso
 from .db import DB, get_db
-from .domain import DataService, ProjectsService, jloads
-from .engine import generate_once, score_prompt
+from .domain import DataService, FeedbackService, ProjectsService, jloads
+from .engine import decide_keep, generate_once, propose_revision, score_prompt
 from .ledger import BudgetState, Ledger, validate_money_budget_needs_prices
 from .stats import (exact_mcnemar, group_outcomes, missing_bounds, paired_bootstrap,
                     zero_event_upper_bound)
@@ -139,19 +139,39 @@ class RunService:
         self._audit("run.create", rid, sh)
         return self.get(rid)
 
-    def get(self, rid: str) -> dict:
+    def get(self, rid: str, detail: bool = False) -> dict:
         r = self.db.one("SELECT * FROM runs WHERE id=?", (rid,))
         if r is None:
             raise BizError("NOT_FOUND", "运行不存在", status=404)
-        return {"id": r["id"], "project_id": r["project_id"], "state": r["state"],
-                "stage": r["stage"], "stop_reason": r["stop_reason"], "revision": r["revision"],
-                "snapshot": jloads(r["snapshot_json"], {}), "snapshot_hash": r["snapshot_hash"],
-                "baseline_prompt_id": r["baseline_prompt_id"],
-                "baseline_score": r["baseline_score"],
-                "candidates": jloads(r["candidates_json"], []),
-                "locked_candidate": r["locked_candidate"],
-                "budget": jloads(r["budget_state_json"], {}),
-                "error": r["error"], "created_at": r["created_at"]}
+        rounds = [{"id": x["id"], "round_no": x["round_no"], "hypothesis": x["hypothesis"],
+                   "problem_evidence": jloads(x["problem_evidence_json"], []),
+                   "prompt_version_id": x["prompt_version_id"], "score": x["score"],
+                   "prev_score": x["prev_score"], "usable_rate": x["usable_rate"],
+                   "severe": x["severe"], "regressions": x["regressions"],
+                   "fixed_problems": jloads(x["fixed_problems_json"], []),
+                   "decision": x["decision"], "rationale": x["rationale"],
+                   "next_direction": x["next_direction"], "length_chars": x["length_chars"],
+                   "status": x["status"], "detail": jloads(x["detail_json"], {}),
+                   "created_at": x["created_at"]}
+                  for x in self.db.query(
+                      "SELECT * FROM run_rounds WHERE run_id=? ORDER BY round_no", (rid,))]
+        base_detail = jloads(r["baseline_detail_json"], {})
+        out = {"id": r["id"], "project_id": r["project_id"], "state": r["state"],
+               "stage": r["stage"], "stop_reason": r["stop_reason"], "revision": r["revision"],
+               "snapshot": jloads(r["snapshot_json"], {}), "snapshot_hash": r["snapshot_hash"],
+               "baseline_prompt_id": r["baseline_prompt_id"],
+               "baseline_score": r["baseline_score"],
+               "candidates": jloads(r["candidates_json"], []),
+               "locked_candidate": r["locked_candidate"],
+               "round_no": r["round_no"], "current_best_pv": r["current_best_pv"],
+               "stall_count": r["stall_count"],
+               "baseline_problems": base_detail.get("problems", {}),
+               "rounds": rounds,
+               "budget": jloads(r["budget_state_json"], {}),
+               "error": r["error"], "created_at": r["created_at"]}
+        if detail:
+            out["baseline_detail"] = base_detail
+        return out
 
     def list(self, pid: str) -> list[dict]:
         return [self.get(r["id"]) for r in
@@ -161,7 +181,7 @@ class RunService:
     # ---------------- 执行（后台线程；协作式取消 TC038；预算暂停）
     def start(self, rid: str) -> None:
         run = self.get(rid)
-        if run["state"] not in ("queued", "paused_budget"):
+        if run["state"] not in ("queued", "paused_budget", "waiting_human"):
             raise BizError("RUN_STATE_INVALID", f"当前状态 {run['state']} 不能启动", status=409)
         self.db.execute("UPDATE runs SET state='running', stop_reason='', error='' WHERE id=?", (rid,))
         t = threading.Thread(target=self._execute, args=(rid,), daemon=True)
@@ -177,76 +197,266 @@ class RunService:
                         (state, stage, stop_reason, now_iso(), rid))
 
     def _execute(self, rid: str) -> None:
+        """多轮优化编排（优化1.0 §8）：原始测评 → 逐轮“证据→改写→复测→择保留”。
+
+        - 未知总收益不展示虚假进度；每轮交付问题证据/假设/测评变化/保留决定
+        - 底线：原有正确案例回退与严重错误增加会否决平均分提升（decide_keep）
+        - 人工参与模式：每轮完成后进入 waiting_human，等待显式继续
+        - 离开页面不取消运行；停止/失败保留已完成输出
+        """
+        from .domain import PromptService
         run = self.get(rid)
         snapshot = run["snapshot"]
         budget = BudgetState(run["budget"])
         ledger = Ledger(self.db)
         project = ProjectsService(self.db).get(run["project_id"])
         try:
-            with self.db.tx() as conn:
-                self._emit(conn, rid, None, "stage", {"stage": "baseline"})
-            self._set_state(rid, "running", "baseline")
+            opt = snapshot.get("optimization", {})
+            max_rounds = int(opt.get("max_rounds") or opt.get("max_candidates") or 0)
+            stall_limit = max(1, int(opt.get("stall_rounds") or 2))
+            length_limit = int(opt.get("length_limit_chars") or 4000)
+            human_in_loop = bool(opt.get("human_in_loop"))
+            target = opt.get("target_score")
+            min_delta = float(opt.get("min_delta") or 0.0)
             dev_ids = snapshot["data"]["dev_item_ids"]
-            sample = dev_ids[: int(snapshot.get("optimization", {}).get("dev_sample_size") or len(dev_ids))]
-            pv = self.db.one("SELECT * FROM prompt_versions WHERE id=?",
-                             (snapshot["prompt"]["baseline_id"],))
-            from .domain import PromptService
-            baseline_pv = PromptService(self.db)._row(pv)
-            base_res = score_prompt(self.db, project, baseline_pv, sample,
-                                    snapshot["rubric_id"], snapshot["models"], rid,
-                                    "search", budget, ledger)
-            with self.db.tx() as conn:
-                self._emit(conn, rid, None, "baseline_done", {k: base_res[k] for k in
-                             ("score", "usable_rate", "n", "n_scored", "severe")})
-            candidates = []
-            if self._cancelled(rid):
-                raise BizError("CANCELLED", "运行已取消")
-            max_cand = int(snapshot.get("optimization", {}).get("max_candidates") or 0)
-            for i in range(max_cand):
+            sample = dev_ids[: int(opt.get("dev_sample_size") or len(dev_ids))]
+            prompt_svc = PromptService(self.db)
+            fb_svc = FeedbackService(self.db)
+            fb_by_item: dict[str, list[dict]] = {}
+            for f in fb_svc.list(run["project_id"]):
+                if f["item_id"] and f["status"] not in ("resolved", "retired"):
+                    fb_by_item.setdefault(f["item_id"], []).append(f)
+            models = snapshot["models"]
+
+            baseline_detail = run.get("baseline_detail") or {}
+            if run["round_no"] == 0 and not baseline_detail:
+                with self.db.tx() as conn:
+                    self._emit(conn, rid, None, "stage", {"stage": "baseline"})
+                self._set_state(rid, "running", "baseline")
+                pv = self.db.one("SELECT * FROM prompt_versions WHERE id=?",
+                                 (snapshot["prompt"]["baseline_id"],))
+                baseline_pv = prompt_svc._row(pv)
+                base_res = score_prompt(self.db, project, baseline_pv, sample,
+                                        snapshot["rubric_id"], models, rid,
+                                        "search", budget, ledger)
+                problems = self._check_item_problems(
+                    project, baseline_pv, base_res["items"], fb_by_item,
+                    snapshot["rubric_id"], models, rid, "search", budget, ledger)
+                baseline_detail = {"items": base_res["items"], "score": base_res["score"],
+                                   "usable_rate": base_res["usable_rate"],
+                                   "severe": base_res["severe"], "n": base_res["n"],
+                                   "problems": problems}
+                self.db.execute("UPDATE runs SET baseline_score=?, baseline_detail_json=?,"
+                                " current_best_pv=?, best_detail_json=?, updated_at=? WHERE id=?",
+                                (base_res["score"],
+                                 json.dumps(baseline_detail, ensure_ascii=False),
+                                 baseline_pv["id"],
+                                 json.dumps({"items": base_res["items"],
+                                             "score": base_res["score"],
+                                             "usable_rate": base_res["usable_rate"],
+                                             "severe": base_res["severe"],
+                                             "problems": problems},
+                                            ensure_ascii=False),
+                                now_iso(), rid))
+                with self.db.tx() as conn:
+                    self._emit(conn, rid, None, "baseline_done",
+                               {k: base_res[k] for k in
+                                ("score", "usable_rate", "n", "n_scored", "severe")})
+                    problem_list = []
+                    for iid, per in problems.items():
+                        for f in fb_by_item.get(iid, []):
+                            problem_list.append({"item_id": iid, "case_id": per.get("case_id"),
+                                                 "feedback_id": f["id"], "problem": f["problem"],
+                                                 "severity": f["severity"], "status": f["status"],
+                                                 "tags": f["tags"],
+                                                 "check": per["statuses"].get(f["id"])})
+                    self._emit(conn, rid, None, "problems_identified",
+                               {"problems": problem_list,
+                                "note": "以上为原始测评发现的问题起点；无登记专家意见时按评价标准诊断"})
+
+            current_best_id = run["current_best_pv"] or snapshot["prompt"]["baseline_id"]
+
+            candidates: list[dict] = jloads(
+                self.db.one("SELECT candidates_json FROM runs WHERE id=?" , (rid,))["candidates_json"],
+                [])
+            stall = int(run["stall_count"])
+            stop_reason = ""
+            round_i = int(run["round_no"])
+
+            while round_i < max_rounds:
+                round_i += 1
                 if self._cancelled(rid):
                     raise BizError("CANCELLED", "运行已取消：停止派发新请求，在途结果仍入账（TC038）")
                 with self.db.tx() as conn:
-                    self._emit(conn, rid, None, "stage", {"stage": f"candidate_{i + 1}"})
-                from .engine import propose_fragment
-                fragment = propose_fragment(self.db, snapshot["models"].get("optimizer")
-                                            or snapshot["models"]["generation"],
-                                            base_res["failures"], rid, budget, ledger)
-                cand_body = baseline_pv["body"].rstrip() + "\n\n" + fragment
-                cand_pv = PromptService(self.db).create_version(
-                    run["project_id"], baseline_pv["name"], cand_body,
-                    baseline_pv["frozen_segments"], baseline_pv["variables"],
-                    baseline_pv["params"], parent_id=baseline_pv["id"], origin="optimizer",
-                    hypothesis=f"候选{i + 1}：按失败证据追加输出要求片段")
-                cand_res = score_prompt(self.db, project, cand_pv, sample, snapshot["rubric_id"],
-                                        snapshot["models"], rid, "search", budget, ledger)
-                candidates.append({"candidate_id": f"cand_{i + 1}", "prompt_version_id": cand_pv["id"],
-                                   "hash": cand_pv["hash"], "parent_id": baseline_pv["id"],
-                                   "score": cand_res["score"], "usable_rate": cand_res["usable_rate"],
-                                   "severe": cand_res["severe"],
-                                   "evidence": cand_res["failures"][:5]})
+                    self._emit(conn, rid, None, "stage", {"stage": f"round_{round_i}"})
+                self._set_state(rid, "running", f"round_{round_i}")
+                best_row = self.db.one("SELECT * FROM prompt_versions WHERE id=?",
+                                       (current_best_id,))
+                best_pv = prompt_svc._row(best_row)
+                best_detail = jloads(self.db.one(
+                    "SELECT best_detail_json FROM runs WHERE id=?", (rid,))["best_detail_json"], {})
+                failures, correct = self._build_evidence(best_detail, fb_by_item)
+                history = [{"round": rr["round_no"], "decision": rr["decision"],
+                            "hypothesis": rr["hypothesis"], "result": rr["status"],
+                            "rationale": rr["rationale"]}
+                           for rr in self.db.query(
+                               "SELECT * FROM run_rounds WHERE run_id=? ORDER BY round_no", (rid,))]
+                rev = propose_revision(self.db, models.get("optimizer") or models["generation"],
+                                       best_pv, project,
+                                       self._rubric_schema(snapshot["rubric_id"]),
+                                       {"failures": failures, "correct": correct},
+                                       history, rid, budget, ledger, length_limit)
+                if not rev["ok"]:
+                    stall += 1
+                    self._record_round(rid, round_i, status="rewrite_failed",
+                                       rationale=rev["reason"])
+                    with self.db.tx() as conn:
+                        self._emit(conn, rid, None, "rewrite_failed",
+                                   {"round": round_i, "reason": rev["reason"]})
+                    self._persist_progress(rid, round_i, current_best_id, stall)
+                    if human_in_loop and stall < stall_limit:
+                        self._pause_for_human(rid, round_i, "改写失败后等待人工确认")
+                        return
+                    if stall >= stall_limit:
+                        stop_reason = "rewrite_stalled"
+                        break
+                    continue
+                if rev["new_body"].strip() == best_pv["body"].strip():
+                    stall += 1
+                    self._record_round(rid, round_i, status="no_change",
+                                       hypothesis=rev["hypothesis"],
+                                       rationale="优化器未提出有依据的修改（原样返回）")
+                    with self.db.tx() as conn:
+                        self._emit(conn, rid, None, "no_change",
+                                   {"round": round_i, "hypothesis": rev["hypothesis"]})
+                    self._persist_progress(rid, round_i, current_best_id, stall)
+                    if human_in_loop and stall < stall_limit:
+                        self._pause_for_human(rid, round_i, "无修改建议，等待人工确认")
+                        return
+                    if stall >= stall_limit:
+                        stop_reason = "stalled_no_gain"
+                        break
+                    continue
+
+                cand_pv = prompt_svc.create_version(
+                    run["project_id"], best_pv["name"], rev["new_body"],
+                    best_pv["frozen_segments"], best_pv["variables"], best_pv["params"],
+                    parent_id=best_pv["id"], origin="optimizer",
+                    hypothesis=rev["hypothesis"])
+                prompt_svc.validate_candidate(best_pv, cand_pv)  # 冻结段校验：任何收费请求前（TC027）
+                cand_res = score_prompt(self.db, project, cand_pv, sample,
+                                        snapshot["rubric_id"], models, rid, "search",
+                                        budget, ledger)
+                cand_problems = self._check_item_problems(
+                    project, cand_pv, cand_res["items"], fb_by_item,
+                    snapshot["rubric_id"], models, rid, "search", budget, ledger)
+                prev_usable = {it["item_id"]: it.get("usable") for it in best_detail.get("items", [])}
+                regressions = sum(1 for it in cand_res["items"]
+                                  if prev_usable.get(it["item_id"]) is True
+                                  and it.get("usable") is False)
+                base_problems = best_detail.get("problems", {})
+                fixed_ids, open_before = [], 0
+                for iid, per in cand_problems.items():
+                    for fbk in per["items"]:
+                        fid = fbk["feedback_id"]
+                        base_st = base_problems.get(iid, {}).get("statuses", {}).get(fid)
+                        cand_st = fbk["status"]
+                        if base_st in (None, "resolved"):
+                            continue
+                        open_before += 1
+                        if cand_st == "resolved":
+                            fixed_ids.append(fid)
+                decision = decide_keep(
+                    {"score": best_detail.get("score", 0.0), "severe": best_detail.get("severe", 0),
+                     "length": len(best_pv["body"])},
+                    {"score": cand_res["score"], "severe": cand_res["severe"],
+                     "length": cand_res["length"], "regressions": regressions,
+                     "fixed_problems": len(fixed_ids), "open_problems_before": open_before},
+                    min_delta)
+                rationale_extra = ""
+                if decision["decision"] == "discarded" and regressions == 0 and \
+                        cand_res["usable_rate"] > (best_detail.get("usable_rate") or 0) and \
+                        len(candidates) < 4:
+                    decision = dict(decision, decision="retained_alt")
+                    rationale_extra = "（虽未成为最优，但可用率更优且无回退：作为各有优势的备选保留，供按偏好选择）"
+                cand_entry = {
+                    "candidate_id": f"cand_{round_i}", "round": round_i,
+                    "prompt_version_id": cand_pv["id"], "hash": cand_pv["hash"],
+                    "parent_id": best_pv["id"],
+                    "score": cand_res["score"], "usable_rate": cand_res["usable_rate"],
+                    "severe": cand_res["severe"], "regressions": regressions,
+                    "fixed_problems": fixed_ids, "length": cand_res["length"],
+                    "hypothesis": rev["hypothesis"], "change_summary": rev.get("change_summary", ""),
+                    "decision": decision["decision"], "rationale": decision["rationale"] + rationale_extra,
+                    "evidence": cand_res["failures"][:5]}
+                candidates.append(cand_entry)
+                self._record_round(rid, round_i, status="scored", hypothesis=rev["hypothesis"],
+                                   problem_evidence=[{"case_id": f.get("case"), "dims": f.get("dims")}
+                                                     for f in failures[:5]],
+                                   prompt_version_id=cand_pv["id"], score=cand_res["score"],
+                                   prev_score=best_detail.get("score", 0.0),
+                                   usable_rate=cand_res["usable_rate"], severe=cand_res["severe"],
+                                   regressions=regressions, fixed_problems=fixed_ids,
+                                   decision=decision["decision"],
+                                   rationale=decision["rationale"] + rationale_extra,
+                                   length_chars=cand_res["length"],
+                                   detail={"change_summary": rev.get("change_summary", ""),
+                                           "problems": cand_problems})
                 with self.db.tx() as conn:
                     self._emit(conn, rid, None, "candidate_done",
-                               {"candidate_id": f"cand_{i + 1}", "score": cand_res["score"]})
-            best = max(candidates, key=lambda c: c["score"]) if candidates else None
-            min_delta = float(snapshot.get("optimization", {}).get("min_delta") or 0.0)
-            locked = ""
-            stop_reason = "no_improvement"
-            if best and best["score"] > base_res["score"] + min_delta:
-                stop_reason = "candidate_found"
-            self.db.execute("UPDATE runs SET candidates_json=?, locked_candidate=?,"
-                            " baseline_score=?, updated_at=? WHERE id=?",
-                            (json.dumps(candidates, ensure_ascii=False), locked,
-                             base_res["score"], now_iso(), rid))
+                               {"candidate_id": cand_entry["candidate_id"],
+                                "score": cand_res["score"],
+                                "decision": decision["decision"],
+                                "rationale": cand_entry["rationale"]})
+                if decision["decision"] == "kept":
+                    stall = 0
+                    current_best_id = cand_pv["id"]
+                    self._persist_progress(rid, round_i, cand_pv["id"], stall,
+                                           best_detail={"items": cand_res["items"],
+                                                        "score": cand_res["score"],
+                                                        "usable_rate": cand_res["usable_rate"],
+                                                        "severe": cand_res["severe"],
+                                                        "problems": cand_problems},
+                                           candidates=candidates)
+                else:
+                    stall += 1
+                    self._persist_progress(rid, round_i, current_best_id, stall,
+                                           candidates=candidates)
+                if target is not None and cand_res["score"] >= float(target) and \
+                        decision["decision"] == "kept":
+                    stop_reason = "target_reached"
+                    break
+                if stall >= stall_limit:
+                    stop_reason = "stalled_no_gain"
+                    break
+                if human_in_loop:
+                    self._pause_for_human(rid, round_i, "本轮已完成，等待指定评价后继续")
+                    return
+
+            baseline_score = jloads(self.db.one(
+                "SELECT baseline_detail_json FROM runs WHERE id=?",
+                (rid,))["baseline_detail_json"], {}).get("score", 0.0)
+            self.db.execute("UPDATE runs SET candidates_json=?, baseline_score=?, updated_at=?"
+                            " WHERE id=?",
+                            (json.dumps(candidates, ensure_ascii=False), baseline_score,
+                             now_iso(), rid))
+            best_score = jloads(self.db.one("SELECT best_detail_json FROM runs WHERE id=?",
+                                            (rid,))["best_detail_json"], {}).get("score")
             if self._cancelled(rid):
-                self._set_state(rid, "cancelled", stop_reason="user_cancelled")
+                final_reason = "user_cancelled"
+                self._set_state(rid, "cancelled", stop_reason=final_reason)
             else:
-                self._set_state(rid, "completed", "done", stop_reason)
+                final_reason = stop_reason or (
+                    "candidate_found" if current_best_id != snapshot["prompt"]["baseline_id"]
+                    else "no_improvement")
+                self._set_state(rid, "completed", "done", final_reason)
             with self.db.tx() as conn:
                 self._emit(conn, rid, None, "completed",
-                           {"stop_reason": stop_reason,
-                            "baseline_score": base_res["score"],
-                            "best_score": best["score"] if best else None,
-                            "note": "无提升为合法结果：保留基线（TC037）" if stop_reason == "no_improvement" else ""})
+                           {"stop_reason": final_reason,
+                            "baseline_score": baseline_score,
+                            "best_score": best_score,
+                            "note": "无提升为合法结果：保留基线（TC037）"
+                            if final_reason == "no_improvement" else ""})
         except BizError as e:
             if e.code == "BUDGET_EXHAUSTED":
                 self._set_state(rid, "paused_budget", stop_reason="budget_exhausted")
@@ -262,6 +472,95 @@ class RunService:
         except Exception as e:  # 未知异常：状态可解释，不静默
             self.db.execute("UPDATE runs SET state='failed', error=?, updated_at=? WHERE id=?",
                             (f"内部错误：{e}", now_iso(), rid))
+
+    # ---- 编排辅助 ----
+    def _rubric_schema(self, rubric_id: str) -> dict:
+        r = self.db.one("SELECT schema_json FROM rubrics WHERE id=?", (rubric_id,))
+        return json.loads(r["schema_json"]) if r else {}
+
+    def _build_evidence(self, best_detail: dict, fb_by_item: dict) -> tuple[list[dict], list[dict]]:
+        """组装优化器证据（§8.2）：失败案例带完整输入/输出/专家意见；正确案例要求保持。"""
+        items = best_detail.get("items", [])
+        scored = [it for it in items if it.get("score") is not None]
+        failures = sorted(scored, key=lambda it: (it.get("score") or 0))[:5]
+        correct = [it for it in scored if it.get("usable") and not it.get("severe")][:3]
+        def pack(it):
+            fb_rows = fb_by_item.get(it["item_id"], [])
+            return {"case_id": it["case_id"], "item_id": it["item_id"],
+                    "runtime_input": it.get("runtime_input", {}),
+                    "output_text": it.get("output_text", ""), "dims": it.get("dims", {}),
+                    "feedback": [{"problem": f["problem"], "quote": f["quote"],
+                                  "expected": f["expected"], "severity": f["severity"],
+                                  "status": f["status"], "tags": f["tags"],
+                                  "remark": f["remark"]} for f in fb_rows]}
+        return [pack(it) for it in failures], [pack(it) for it in correct]
+
+    def _check_item_problems(self, project, prompt_pv, items_detail, fb_by_item,
+                             rubric_id, models, rid, phase, budget, ledger) -> dict:
+        """对带登记专家意见的案例核查问题状态；无意见的案例不发起调用。"""
+        from .engine import check_problems
+        out = {}
+        ev_model = models.get("evaluation") or models["generation"]
+        for it in items_detail:
+            fbs = fb_by_item.get(it["item_id"])
+            if not fbs or it.get("gen_status") != "ok" or not it.get("output_text"):
+                continue
+            plist = [{"id": f["id"], "problem": f["problem"], "expected": f["expected"]}
+                     for f in fbs]
+            res = check_problems(self.db, plist, it["output_text"], ev_model, rid,
+                                 phase, budget, ledger)
+            out[it["item_id"]] = {"case_id": it["case_id"], "abstain": res.get("abstain", False),
+                                  "statuses": res["statuses"],
+                                  "items": [{"feedback_id": p["id"], "status": res["statuses"][p["id"]]}
+                                            for p in plist]}
+        return out
+
+    def _record_round(self, rid: str, round_no: int, status: str, hypothesis: str = "",
+                      problem_evidence: list | None = None, prompt_version_id: str = "",
+                      score: float | None = None, prev_score: float | None = None,
+                      usable_rate: float | None = None, severe: int | None = None,
+                      regressions: int = 0, fixed_problems: list | None = None,
+                      decision: str = "", rationale: str = "", next_direction: str = "",
+                      length_chars: int = 0, detail: dict | None = None) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO run_rounds(id,run_id,round_no,hypothesis,"
+            "problem_evidence_json,prompt_version_id,score,prev_score,usable_rate,severe,"
+            "regressions,fixed_problems_json,decision,rationale,next_direction,length_chars,"
+            "status,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"rnd_{rid}_{round_no}", rid, round_no, hypothesis,
+             json.dumps(problem_evidence or [], ensure_ascii=False), prompt_version_id,
+             score, prev_score, usable_rate, severe, regressions,
+             json.dumps(fixed_problems or [], ensure_ascii=False), decision, rationale,
+             next_direction, length_chars, status,
+             json.dumps(detail or {}, ensure_ascii=False), now_iso()))
+
+    def _persist_progress(self, rid: str, round_no: int, current_best_pv: str, stall: int,
+                          best_detail: dict | None = None, candidates: list | None = None) -> None:
+        sets = ["round_no=?", "current_best_pv=?", "stall_count=?", "updated_at=?"]
+        params = [round_no, current_best_pv, stall, now_iso()]
+        if best_detail is not None:
+            sets.append("best_detail_json=?")
+            params.append(json.dumps(best_detail, ensure_ascii=False))
+        if candidates is not None:
+            sets.append("candidates_json=?")
+            params.append(json.dumps(candidates, ensure_ascii=False))
+        params.append(rid)
+        self.db.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id=?", tuple(params))
+
+    def _pause_for_human(self, rid: str, round_no: int, reason: str) -> None:
+        self._set_state(rid, "waiting_human", f"round_{round_no}")
+        with self.db.tx() as conn:
+            self._emit(conn, rid, None, "waiting_human",
+                       {"round": round_no, "reason": reason,
+                        "note": "运行已暂停等待人工参与；离开页面不影响状态，服务保持运行时后台等待"})
+
+    def continue_run(self, rid: str) -> dict:
+        """人工参与模式：等待人工评价后显式继续（§8.5）。"""
+        run = self.get(rid)
+        if run["state"] != "waiting_human":
+            raise BizError("RUN_STATE_INVALID", "只有等待人工参与的运行可以继续", status=409)
+        self.start(rid)
+        return self.get(rid)
 
     def _emit(self, conn, rid: str, seq, etype: str, payload: dict) -> None:
         row = conn.execute("SELECT COALESCE(MAX(seq),0)+1 AS n FROM run_events WHERE run_id=?",
@@ -360,6 +659,12 @@ class AcceptanceService:
 
         pairs = []
         severe_base = severe_cand = unknown = 0
+        fb_by_item: dict[str, list[dict]] = {}
+        for f in FeedbackService(self.db).list(run["project_id"]):
+            if f["item_id"] and f["status"] not in ("resolved", "retired"):
+                fb_by_item.setdefault(f["item_id"], []).append(f)
+        from .engine import check_problems, evaluate_once
+        from .providers import has_severe_error, is_usable
         for art in sealed:
             item = {"id": art["item_id"], "case_id": art["item_id"],
                     "runtime_input": art["runtime_input"], "source_group_id": art["item_id"]}
@@ -368,8 +673,6 @@ class AcceptanceService:
                                "acceptance", budget, ledger)
             oc = generate_once(self.db, project, pv_cand, item, models["generation"], rid,
                                "acceptance", budget, ledger)
-            from .engine import evaluate_once
-            from .providers import has_severe_error, is_usable
             row_b = self.db.one("SELECT text FROM outputs WHERE id=?", (ob["id"],))
             row_c = self.db.one("SELECT text FROM outputs WHERE id=?", (oc["id"],))
             sb = evaluate_once(row_b["text"], rubric_id, models["evaluation"], rid, "acceptance") \
@@ -384,6 +687,17 @@ class AcceptanceService:
                      and ob["status"] == "ok" else None,
                      "cand_severe": has_severe_error(row_c["text"], sc) if not sc.get("abstain")
                      and oc["status"] == "ok" else None}
+            # 问题级核查（§9.3 问题项口径）：仅对登记了专家意见的封存案例发起调用
+            fbs = fb_by_item.get(art["item_id"]) or []
+            if fbs and ob["status"] == "ok" and oc["status"] == "ok":
+                plist = [{"id": f["id"], "problem": f["problem"], "expected": f["expected"]}
+                         for f in fbs]
+                entry["base_problem_status"] = check_problems(
+                    self.db, plist, row_b["text"], models["evaluation"], rid,
+                    "acceptance", budget, ledger)["statuses"]
+                entry["cand_problem_status"] = check_problems(
+                    self.db, plist, row_c["text"], models["evaluation"], rid,
+                    "acceptance", budget, ledger)["statuses"]
             if entry["base_severe"]:
                 severe_base += 1
             if entry["cand_severe"]:
@@ -424,6 +738,42 @@ class AcceptanceService:
             decision = "regression"
         else:
             decision = "no_improvement"
+        # 问题项口径（§9.3）：完全解决/部分解决/未解决/无法判断 分开统计；
+        # ABCD 分布同时展示原问题改善与新增问题两个维度，无法判断单独记录
+        resolution = {"resolved": 0, "partial": 0, "unresolved": 0, "unknown": 0,
+                      "already_ok": 0}
+        abcd = {"A": 0, "B": 0, "C": 0, "D": 0, "cannot_judge": 0, "not_rated": 0}
+        rated_cases = 0
+        for p in pairs:
+            base_ps = p.get("base_problem_status") or {}
+            cand_ps = p.get("cand_problem_status") or {}
+            if not base_ps:
+                abcd["not_rated"] += 1  # 无登记问题：按通用质量标准评价，不强行套用原问题解决率
+                continue
+            rated_cases += 1
+            present = [k for k, st in base_ps.items() if st in ("partial", "unresolved")]
+            cand_sts = [cand_ps.get(k, "unknown") for k in present]
+            for k, st in base_ps.items():
+                cst = cand_ps.get(k, "unknown")
+                if st == "resolved":
+                    resolution["already_ok"] += 1
+                else:
+                    resolution[cst if cst in resolution else "unknown"] += 1
+            if p.get("cand_severe") and not p.get("base_severe"):
+                abcd["D"] += 1
+            elif any(s == "unknown" for s in cand_sts):
+                abcd["cannot_judge"] += 1
+            elif not present:
+                abcd["not_rated"] += 1  # 基线即无此问题：无原问题可解决
+            elif present and all(s == "resolved" for s in cand_sts):
+                abcd["A"] += 1
+            elif present and all(s == "unresolved" for s in cand_sts):
+                abcd["C"] += 1
+            else:
+                abcd["B"] += 1
+        total_registered = sum(v for k, v in resolution.items() if k != "already_ok") \
+            + resolution["already_ok"]
+
         stats = {
             "group_n": n, "sealed_total": len(sealed), "unknown": unknown,
             "baseline_usable_rate": base_rate, "candidate_usable_rate": cand_rate,
@@ -435,6 +785,20 @@ class AcceptanceService:
                             .format(sev_upper) if sev_upper is not None else ""),
             "policy": policy, "primary_metric": policy.get("primary_metric") or
             project["contract"].get("primary_metric"),
+            "problem_stats": {
+                "total_registered": total_registered, "rated_cases": rated_cases,
+                "resolution": resolution, "abcd": abcd,
+                "note": ("封存案例未登记专家问题：按通用质量标准评价，不强行套用原问题解决率（§9.2）"
+                         if total_registered == 0 else
+                         "ABCD按默认规则建议生成，始终同时展示原问题改善与新增问题；无法判断单独记录"),
+            },
+            "evidence_scope": {
+                "optimization_sample": {"n": len(snapshot.get("data", {}).get("dev_item_ids", [])),
+                                        "role": "本批案例改善（不构成独立证明）"},
+                "independent": {"set": "sealed_test", "n": len(sealed), "consumed": True,
+                                "role": "独立验证（未参与修改的案例）"},
+                "note": "优化样例与独立验证结果分别展示；复制文本不等于验证通过（§9.2/§9.4）",
+            },
         }
         rep_id = new_id("rep")
         self.db.execute(

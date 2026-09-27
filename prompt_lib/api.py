@@ -13,8 +13,8 @@ from pydantic import BaseModel
 
 from .core import BizError
 from .db import get_db
-from .domain import (AnnotationService, DataService, JudgeService, ProjectsService,
-                     PromptService, RubricService)
+from .domain import (AnnotationService, DataService, FeedbackService, JudgeService,
+                     ProjectsService, PromptService, RatingService, RubricService)
 from .runs import AcceptanceService, ReleaseService, RunService
 
 API = "/workflow-api/v1"
@@ -70,11 +70,14 @@ def _routes(app: FastAPI):
     class ProjectIn(BaseModel):
         name: str
         description: str = ""
-        task_type: str
+        task_type: str = "custom"
+        contract: dict | None = None   # 自定义任务契约（模板仅是可选示例，优化1.0 §3.2）
+        goal: str = ""                 # 优化目标：自由描述
 
     @app.post(API + "/projects", status_code=201)
     def create_project(body: ProjectIn):
-        return ProjectsService().create(body.name, body.description, body.task_type)
+        return ProjectsService().create(body.name, body.description, body.task_type,
+                                        body.contract, body.goal)
 
     @app.get(API + "/projects")
     def list_projects():
@@ -84,6 +87,22 @@ def _routes(app: FastAPI):
     def get_project(pid: str):
         return ProjectsService().get(pid)
 
+    class GoalIn(BaseModel):
+        goal: str
+
+    @app.put(API + "/projects/{pid}/goal")
+    def update_goal(pid: str, body: GoalIn):
+        return ProjectsService().update_goal(pid, body.goal)
+
+    @app.get(API + "/projects/{pid}/progress")
+    def progress(pid: str):
+        return ProjectsService().progress(pid)
+
+    @app.delete(API + "/projects/{pid}")
+    def delete_project(pid: str):
+        """硬删除项目及全部从属数据（测试阶段能力，不可恢复）。"""
+        return ProjectsService().delete(pid)
+
     @app.post(API + "/projects/{pid}/archive")
     def archive(pid: str):
         return ProjectsService().archive(pid, True)
@@ -91,6 +110,12 @@ def _routes(app: FastAPI):
     @app.post(API + "/projects/{pid}/unarchive")
     def unarchive(pid: str):
         return ProjectsService().archive(pid, False)
+
+    @app.post(API + "/demo/seed")
+    def demo_seed():
+        """生成（或复用）内置示例项目：离线模拟数据完整跑通一次优化流程，供用户浏览学习。"""
+        from .demo_seed import seed_demo
+        return seed_demo()
 
     @app.get(API + "/projects/{pid}/readiness")
     def readiness(pid: str):
@@ -379,8 +404,12 @@ def _routes(app: FastAPI):
         return run
 
     @app.get(API + "/runs/{rid}")
-    def run_get(rid: str):
-        return RunService().get(rid)
+    def run_get(rid: str, detail: bool = False):
+        return RunService().get(rid, detail=detail)
+
+    @app.post(API + "/runs/{rid}/continue")
+    def run_continue(rid: str):
+        return RunService().continue_run(rid)
 
     @app.get(API + "/runs/{rid}/events")
     def run_events(rid: str, cursor: int = 0):
@@ -453,6 +482,122 @@ def _routes(app: FastAPI):
     @app.get(API + "/projects/{pid}/feedback")
     def feedback_list(pid: str):
         return {"feedback": ReleaseService().feedback_list(pid)}
+
+    # ---------------- 专家意见与标签（优化1.0 §6.3/§6.4）
+    class FeedbackIn(BaseModel):
+        item_id: str = ""
+        problem: str
+        quote: str = ""
+        expected: str = ""
+        check_method: str = ""
+        severity: str = "normal"
+        status: str = "pending"
+        tags: list[str] = []
+        remark: str = ""
+
+    @app.post(API + "/projects/{pid}/expert_feedback", status_code=201)
+    def feedback_add(pid: str, body: FeedbackIn):
+        return FeedbackService().add(pid, body.item_id, body.problem, body.quote,
+                                     body.expected, body.check_method, body.severity,
+                                     body.status, body.tags, body.remark)
+
+    @app.get(API + "/projects/{pid}/expert_feedback")
+    def feedback_list(pid: str, item_id: str | None = None):
+        return {"feedback": FeedbackService().list(pid, item_id=item_id)}
+
+    @app.put(API + "/expert_feedback/{fid}")
+    def feedback_update(fid: str, body: dict):
+        return FeedbackService().update(fid, body)
+
+    class FeedbackImportIn(BaseModel):
+        content: str
+
+    @app.post(API + "/projects/{pid}/expert_feedback/import")
+    def feedback_import(pid: str, body: FeedbackImportIn):
+        return FeedbackService().import_jsonl(pid, body.content)
+
+    @app.get(API + "/projects/{pid}/expert_feedback/suggestions")
+    def feedback_suggestions(pid: str):
+        return FeedbackService().suggest_check_aspects(pid)
+
+    class TagIn(BaseModel):
+        name: str
+        definition: str = ""
+
+    @app.post(API + "/projects/{pid}/tags", status_code=201)
+    def tag_add(pid: str, body: TagIn):
+        return FeedbackService().add_tag(pid, body.name, body.definition)
+
+    @app.get(API + "/projects/{pid}/tags")
+    def tag_list(pid: str):
+        return {"tags": FeedbackService().list_tags(pid)}
+
+    class TagMergeIn(BaseModel):
+        into_id: str
+
+    @app.post(API + "/tags/{tag_id}/merge")
+    def tag_merge(tag_id: str, body: TagMergeIn):
+        return FeedbackService().merge_tag(tag_id, body.into_id)
+
+    @app.post(API + "/tags/{tag_id}/retire")
+    def tag_retire(tag_id: str):
+        return FeedbackService().retire_tag(tag_id)
+
+    # ---------------- 评级规则与案例评级（优化1.0 §6.4/§6.5）
+    @app.post(API + "/projects/{pid}/rating_rules", status_code=201)
+    def rating_default(pid: str):
+        return RatingService().create_default(pid)
+
+    @app.get(API + "/projects/{pid}/rating_rules")
+    def rating_list(pid: str):
+        return {"rules": RatingService().list(pid)}
+
+    @app.get(API + "/rating_rules/{rid}")
+    def rating_get(rid: str):
+        return RatingService().get(rid)
+
+    class RatingUpdateIn(BaseModel):
+        levels: list[dict]
+        note: str = ""
+
+    @app.put(API + "/rating_rules/{rid}")
+    def rating_update(rid: str, body: RatingUpdateIn):
+        return RatingService().update_draft(rid, body.levels, body.note)
+
+    @app.post(API + "/rating_rules/{rid}/publish")
+    def rating_publish(rid: str):
+        return RatingService().publish(rid)
+
+    class ReviewIn(BaseModel):
+        item_id: str
+        rule_id: str
+        rating: str
+        resolutions: list[dict] = []
+        new_problems: list[dict] = []
+        regress_note: str = ""
+        remark: str = ""
+        source: str = "human"
+
+    @app.post(API + "/projects/{pid}/case_reviews", status_code=201)
+    def review_submit(pid: str, body: ReviewIn):
+        return RatingService().submit_case_review(
+            pid, body.item_id, body.rule_id, body.rating, body.resolutions,
+            body.new_problems, body.regress_note, body.remark, body.source)
+
+    @app.get(API + "/projects/{pid}/case_reviews")
+    def review_list(pid: str, item_id: str | None = None):
+        return {"reviews": RatingService().list_reviews(pid, item_id=item_id)}
+
+    class ReviewSuggestIn(BaseModel):
+        item_id: str
+        rule_id: str
+        problem_statuses: dict = {}
+        new_problems: list[dict] = []
+
+    @app.post(API + "/projects/{pid}/case_reviews/suggest")
+    def review_suggest(pid: str, body: ReviewSuggestIn):
+        return RatingService().suggest_review(pid, body.item_id, body.rule_id,
+                                              body.problem_statuses, body.new_problems)
 
     # ---------------- 设置 P14
     @app.get(API + "/settings/connections")

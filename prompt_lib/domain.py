@@ -13,7 +13,9 @@ import io
 import json
 import random
 
-from .core import BizError, canonical_hash, new_id, now_iso, sha256_text, template_draft
+from .core import (BizError, DEFAULT_ABCD_LEVELS, RATING_SPECIAL, RESOLUTION_STATES,
+                   TASK_TEMPLATES, canonical_hash, new_id, now_iso, sha256_text,
+                   template_draft)
 from .db import DB, get_db
 
 MAX_TEXT_LEN = 20000
@@ -33,31 +35,51 @@ class ProjectsService:
     def __init__(self, db: DB | None = None):
         self.db = db or get_db()
 
-    def create(self, name: str, description: str, task_type: str) -> dict:
+    def create(self, name: str, description: str, task_type: str,
+               contract: dict | None = None, goal: str = "") -> dict:
+        """创建项目。任务模板仅是可选示例（优化1.0 §3.2）：用户可自带自定义契约。"""
         if not (name or "").strip():
             raise BizError("FIELD_REQUIRED", "项目名称不能为空", field_errors={"name": "必填"})
-        draft = template_draft(task_type)
-        contract = {
-            "task_type": task_type,
-            "runtime_fields": draft["runtime_fields"],
-            "evaluation_fields": draft["evaluation_fields"],
-            "evaluation_unit": draft["evaluation_unit"],
-            "primary_metric": draft["primary_metric"],
-            "acceptance_policy": {
+        if contract:
+            from .core import normalize_custom_contract
+            contract = normalize_custom_contract({**contract, "goal": goal})
+            effective_type = contract["task_type"]
+        else:
+            draft = template_draft(task_type)
+            effective_type = task_type
+            contract = {
+                "task_type": task_type,
+                "label": draft["label"],
+                "goal": goal,
+                "runtime_fields": draft["runtime_fields"],
+                "evaluation_fields": draft["evaluation_fields"],
+                "evaluation_unit": draft["evaluation_unit"],
                 "primary_metric": draft["primary_metric"],
-                "min_observed_improvement": 0.05,
-                "ci_rule": "lower_bound_gt_zero",
-                "severe_error_gate": True,
-            },
-            "is_demo": True,
-        }
+                "acceptance_policy": {
+                    "primary_metric": draft["primary_metric"],
+                    "min_observed_improvement": 0.05,
+                    "ci_rule": "lower_bound_gt_zero",
+                    "severe_error_gate": True,
+                },
+                "is_demo": True,
+            }
+        contract["goal"] = goal or contract.get("goal", "")
         pid = new_id("prj")
         with self.db.tx() as conn:
             conn.execute(
                 "INSERT INTO projects(id,name,description,task_type,contract_json,status,created_at)"
                 " VALUES(?,?,?,?,?,'active',?)",
-                (pid, name.strip(), description or "", task_type,
+                (pid, name.strip(), description or "", effective_type,
                  json.dumps(contract, ensure_ascii=False), now_iso()))
+        return self.get(pid)
+
+    def update_goal(self, pid: str, goal: str) -> dict:
+        """优化目标是自由描述（§5.2），由系统辅助整理；随时可改，不影响已快照的历史运行。"""
+        p = self.get(pid)
+        contract = dict(p["contract"])
+        contract["goal"] = (goal or "").strip()
+        self.db.execute("UPDATE projects SET contract_json=? WHERE id=?",
+                        (json.dumps(contract, ensure_ascii=False), pid))
         return self.get(pid)
 
     def get(self, pid: str) -> dict:
@@ -88,6 +110,32 @@ class ProjectsService:
                         ("archived" if archived else "active", pid))
         self.audit("system", "project.archive" if archived else "project.unarchive", pid)
         return self.get(pid)
+
+    def delete(self, pid: str) -> dict:
+        """硬删除项目及其全部从属数据（测试阶段能力；正式环境请先备份）。
+
+        级联清理：案例/封存/导入批次/切分/标准/输出/标注/对比/评价器/提示词/
+        运行（含账本、事件、轮次）/验收报告/发布/反馈/标签/专家意见/评级规则/案例评级。
+        audit_log 为追加日志，仅保留删除事件本身。
+        """
+        self.get(pid)
+        batch_ids = [r["id"] for r in
+                     self.db.query("SELECT id FROM import_batches WHERE project_id=?", (pid,))]
+        with self.db.tx() as conn:
+            for run in conn.execute(
+                    "SELECT id FROM runs WHERE project_id=?", (pid,)).fetchall():
+                for t in ("ledger", "run_events", "run_rounds"):
+                    conn.execute(f"DELETE FROM {t} WHERE run_id=?", (run["id"],))
+            for t in ("dataset_items", "sealed_artifacts", "import_batches", "split_manifests",
+                      "dataset_versions", "rubrics", "outputs", "annotations", "blind_pairs",
+                      "judges", "prompt_versions", "runs", "acceptance_reports", "releases",
+                      "feedback", "tags", "expert_feedback", "rating_rules", "case_reviews"):
+                conn.execute(f"DELETE FROM {t} WHERE project_id=?", (pid,))
+            for bid in batch_ids:
+                conn.execute("DELETE FROM settings WHERE key=?", (f"src:{bid}",))
+            conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+        self.audit("system", "project.delete", pid)
+        return {"deleted": pid}
 
     def ensure_active(self, pid: str) -> dict:
         p = self.get(pid)
@@ -157,6 +205,57 @@ class ProjectsService:
         else:
             state = "experiment_ready"
         return {"state": state, "checks": checks}
+
+    def progress(self, pid: str) -> dict:
+        """五步流程进度（优化1.0 §4.2）：每步为何要做、当前状态与下一步主行动。"""
+        p = self.get(pid)
+        dev_n = self.db.one(
+            "SELECT COUNT(*) AS c FROM dataset_items WHERE project_id=? AND split IN ('dev','select')",
+            (pid,))["c"]
+        prompt_n = self.db.one("SELECT COUNT(*) AS c FROM prompt_versions WHERE project_id=?", (pid,))
+        rub_pub = self.db.one(
+            "SELECT COUNT(*) AS c FROM rubrics WHERE project_id=? AND status='published'", (pid,))
+        runs = self.db.query("SELECT * FROM runs WHERE project_id=?", (pid,))
+        baseline_done = any(r["baseline_detail_json"] and r["baseline_detail_json"] != "{}"
+                            for r in runs)
+        kept_any = any("kept" in (r["candidates_json"] or "") for r in runs)
+        reports_n = self.db.one(
+            "SELECT COUNT(*) AS c FROM acceptance_reports WHERE project_id=?", (pid,))["c"]
+        steps = [
+            {"key": "prepare", "name": "准备材料",
+             "why": "把你的提示词和真实案例交给系统，它才知道要优化什么、实际会遇到哪些情况。",
+             "then": "系统检查材料并标出每个字段的用途；案例就绪后进入下一步。",
+             "done": prompt_n["c"] >= 1 and dev_n >= 1,
+             "explain": f"提示词版本 {prompt_n['c']} 个，可用案例 {dev_n} 条",
+             "action": "去准备提示词和案例" if prompt_n["c"] < 1 or dev_n < 1 else "查看已准备的材料"},
+            {"key": "confirm_eval", "name": "确认怎么评",
+             "why": "先说好“怎样算改好了”，系统才能自动判断改得有没有效——标准由你确认，系统不会私自更改。",
+             "then": "生成一份运行摘要；确认后就能开始原始测评。",
+             "done": rub_pub["c"] >= 1,
+             "explain": "评价标准已发布" if rub_pub["c"] >= 1 else "还没有约定评价标准",
+             "action": "去确认评价方式" if rub_pub["c"] < 1 else "查看评价方式"},
+            {"key": "baseline", "name": "原始测评",
+             "why": "先测一遍现在的提示词，看清它差在哪——这是后面所有比较的起点。",
+             "then": "得到一份带证据的问题清单；确认这些问题确实是你想解决的。",
+             "done": baseline_done,
+             "explain": "已完成原始测评" if baseline_done else "还没有测过现状",
+             "action": "去测现状" if not baseline_done else "查看问题清单"},
+            {"key": "optimize", "name": "自动优化",
+             "why": "系统反复“改一点→测一遍”，只保留真的变好的版本；原来会的不能变差。",
+             "then": "每轮都有“为什么改、改了什么、效果如何”的记录；结束后锁定待验证的版本。",
+             "done": kept_any,
+             "explain": "已有保留的优化候选" if kept_any else "还没有产生保留的改写",
+             "action": "开始自动优化" if not kept_any else "查看优化过程"},
+            {"key": "verify", "name": "验证与使用",
+             "why": "用没参与过修改的新案例做最终检验，防止只是“背会了练习题”。",
+             "then": "得到明确结论（有效/未见提升/退步/证据不足）和报告；通过后拿走新提示词。",
+             "done": reports_n >= 1,
+             "explain": f"独立验证报告 {reports_n} 份" if reports_n else "还没有做过独立验证",
+             "action": "去做最终检验" if not reports_n else "查看结果报告"},
+        ]
+        current = next((s for s in steps if not s["done"]), steps[-1])
+        return {"project": p, "steps": steps, "current": current["key"],
+                "next_action": current["action"]}
 
 
 # ---------------------------------------------------------------- 数据 P03
@@ -505,10 +604,26 @@ class RubricService:
         contract = json.loads(self.db.one("SELECT contract_json FROM projects WHERE id=?",
                                           (pid,))["contract_json"])
         task = contract["task_type"]
-        from .core import TASK_TEMPLATES
-        t = TASK_TEMPLATES[task]
-        schema = {"dimensions": t["dimensions"], "error_tags": [], "hard_rules": [],
-                  "severity_examples": t["severity_examples"], "weights": {}}
+        if task in TASK_TEMPLATES:
+            t = TASK_TEMPLATES[task]
+            schema = {"dimensions": t["dimensions"], "error_tags": [], "hard_rules": [],
+                      "severity_examples": t["severity_examples"], "weights": {}}
+        else:
+            # 自定义任务：生成可编辑的通用草案（§6.2 系统建议，需人工确认）；
+            # 契约自带 dimensions 时优先使用
+            dims = contract.get("dimensions") or [
+                {"name": "整体可用", "anchors": {"0": "输出完全不可用，需要重做",
+                                                 "1": "方向正确但需大幅重写",
+                                                 "2": "小改后可用",
+                                                 "3": "可直接使用"}},
+                {"name": "符合要求", "anchors": {"0": "违反任务硬性约束",
+                                                 "1": "多处不符合要求",
+                                                 "2": "基本符合要求",
+                                                 "3": "完全符合且处理了边界情况"}},
+            ]
+            schema = {"dimensions": dims, "error_tags": [], "hard_rules": [],
+                      "severity_examples": contract.get("severity_examples") or [],
+                      "weights": {}}
         return self._insert(pid, schema, status="draft")
 
     def _insert(self, pid: str, schema: dict, status: str) -> dict:
@@ -619,6 +734,7 @@ class PromptService:
                 "variables": jloads(r["variables_json"], []),
                 "params": jloads(r["params_json"], {}), "hash": r["hash"],
                 "origin": r["origin"], "hypothesis": r["hypothesis"],
+                "length": len(r["body"] or ""),
                 "created_at": r["created_at"]}
 
     def list(self, pid: str) -> list[dict]:
@@ -925,6 +1041,409 @@ class JudgeService:
                 else:
                     pd["severe_recall"] = None  # 无正例：召回不可估，不声称高召回（TC022）
         return {"n": n, "per_dim": per_dim}
+
+
+# ---------------------------------------------------------------- 专家意见与标签（优化1.0 §6.3/§6.4）
+
+SEVERITIES = ("severe", "normal", "preference")       # 严重问题/一般问题/偏好建议
+FEEDBACK_STATUSES = ("pending", "confirmed_error", "preference", "unverified",
+                     "resolved", "retired")
+
+
+class FeedbackService:
+    """专家意见整理为待确认检查项：原话保留、证据关联、状态与标签可追溯。
+
+    与“学员得分”（AI 对学员作答的业务评分）明确区分：这里是专家对 AI 输出质量的判断。
+    """
+
+    def __init__(self, db: DB | None = None):
+        self.db = db or get_db()
+
+    def add(self, pid: str, item_id: str, problem: str, quote: str = "",
+            expected: str = "", check_method: str = "", severity: str = "normal",
+            status: str = "pending", tags: list[str] | None = None,
+            remark: str = "", source: str = "manual") -> dict:
+        self._project(pid)
+        if not (problem or "").strip():
+            raise BizError("FIELD_REQUIRED", "问题描述不能为空", field_errors={"problem": "必填"})
+        if severity not in SEVERITIES:
+            raise BizError("SEVERITY_INVALID", f"影响程度必须是 {'/'.join(SEVERITIES)}")
+        if status not in FEEDBACK_STATUSES:
+            raise BizError("STATUS_INVALID", f"状态必须是 {'/'.join(FEEDBACK_STATUSES)}")
+        if item_id:
+            if self.db.one("SELECT 1 FROM dataset_items WHERE id=? AND project_id=?",
+                           (item_id, pid)) is None:
+                raise BizError("NOT_FOUND", "案例不存在或不属于该项目", status=404)
+        tag_names = self._ensure_tags(pid, tags or [])
+        fid = new_id("fbk")
+        now = now_iso()
+        self.db.execute(
+            "INSERT INTO expert_feedback(id,project_id,item_id,quote,problem,expected,"
+            "check_method,severity,status,tags_json,remark,source,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fid, pid, item_id, quote or "", problem.strip(), expected or "", check_method or "",
+             severity, status, json.dumps(tag_names, ensure_ascii=False), remark or "",
+             source, now, now))
+        self._audit(pid, "expert_feedback.add", fid)
+        return self.get(fid)
+
+    def update(self, fid: str, changes: dict) -> dict:
+        """用户可修改状态/期望/检查方式/影响程度/标签/备注；系统永不改写专家原话与备注原文。"""
+        cur = self.get(fid)
+        allowed = {"problem", "expected", "check_method", "severity", "status",
+                   "remark", "quote", "item_id"}
+        sets, params = [], []
+        for k, v in changes.items():
+            if k not in allowed or v is None:
+                continue
+            if k == "severity" and v not in SEVERITIES:
+                raise BizError("SEVERITY_INVALID", f"影响程度必须是 {'/'.join(SEVERITIES)}")
+            if k == "status" and v not in FEEDBACK_STATUSES:
+                raise BizError("STATUS_INVALID", f"状态必须是 {'/'.join(FEEDBACK_STATUSES)}")
+            if k == "item_id" and v:
+                if self.db.one("SELECT 1 FROM dataset_items WHERE id=? AND project_id=?",
+                               (v, cur["project_id"])) is None:
+                    raise BizError("NOT_FOUND", "案例不存在或不属于该项目", status=404)
+            sets.append(f"{k}=?")
+            params.append(v)
+        if "tags" in changes and changes["tags"] is not None:
+            sets.append("tags_json=?")
+            params.append(json.dumps(self._ensure_tags(cur["project_id"], changes["tags"]),
+                                     ensure_ascii=False))
+        if not sets:
+            return cur
+        sets.append("updated_at=?")
+        params.append(now_iso())
+        params.append(fid)
+        self.db.execute(f"UPDATE expert_feedback SET {', '.join(sets)} WHERE id=?", tuple(params))
+        return self.get(fid)
+
+    def get(self, fid: str) -> dict:
+        r = self.db.one("SELECT * FROM expert_feedback WHERE id=?", (fid,))
+        if r is None:
+            raise BizError("NOT_FOUND", "专家意见不存在", status=404)
+        return self._row(r)
+
+    @staticmethod
+    def _row(r) -> dict:
+        return {"id": r["id"], "project_id": r["project_id"], "item_id": r["item_id"],
+                "quote": r["quote"], "problem": r["problem"], "expected": r["expected"],
+                "check_method": r["check_method"], "severity": r["severity"],
+                "status": r["status"], "tags": jloads(r["tags_json"], []), "remark": r["remark"],
+                "source": r["source"], "created_at": r["created_at"], "updated_at": r["updated_at"]}
+
+    def list(self, pid: str, item_id: str | None = None,
+             statuses: list[str] | None = None) -> list[dict]:
+        cond, params = ["project_id=?"], [pid]
+        if item_id:
+            cond.append("item_id=?")
+            params.append(item_id)
+        if statuses:
+            qs = ",".join("?" for _ in statuses)
+            cond.append(f"status IN ({qs})")
+            params.extend(statuses)
+        return [self._row(r) for r in self.db.query(
+            f"SELECT * FROM expert_feedback WHERE {' AND '.join(cond)}"
+            " ORDER BY created_at", tuple(params))]
+
+    def import_jsonl(self, pid: str, content: str) -> dict:
+        """批量导入已有专家评价：逐行报错，不静默丢行；case_id 关联已导入案例。"""
+        created, errors = [], []
+        for i, line in enumerate(content.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as e:
+                errors.append({"line": i, "reason": f"JSON解析失败：{e}"})
+                continue
+            case_id = str(row.get("case_id") or "").strip()
+            item = self.db.one("SELECT id FROM dataset_items WHERE project_id=? AND case_id=?",
+                               (pid, case_id)) if case_id else None
+            if case_id and item is None:
+                errors.append({"line": i, "case_id": case_id, "reason": "案例不存在：请先导入案例"})
+                continue
+            if not str(row.get("problem") or "").strip():
+                errors.append({"line": i, "case_id": case_id, "reason": "缺少 problem 问题描述"})
+                continue
+            try:
+                created.append(self.add(pid, item["id"] if item else "",
+                                        row.get("problem"), quote=row.get("quote", ""),
+                                        expected=row.get("expected", ""),
+                                        check_method=row.get("check_method", ""),
+                                        severity=row.get("severity", "normal"),
+                                        status=row.get("status", "pending"),
+                                        tags=row.get("tags") or [], remark=row.get("remark", ""),
+                                        source="import"))
+            except BizError as e:
+                errors.append({"line": i, "case_id": case_id, "reason": e.message})
+        return {"created": len(created), "errors": errors, "items": created}
+
+    # ---- 标签：创建/定义/停用/同义合并；保留历史与合并关系（§6.4）
+    def add_tag(self, pid: str, name: str, definition: str = "") -> dict:
+        self._project(pid)
+        name = (name or "").strip()
+        if not name:
+            raise BizError("FIELD_REQUIRED", "标签名不能为空")
+        exist = self.db.one("SELECT * FROM tags WHERE project_id=? AND name=?", (pid, name))
+        if exist:
+            self.db.execute("UPDATE tags SET definition=?, active=1, merged_into='' WHERE id=?",
+                            (definition or exist["definition"], exist["id"]))
+            return self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (exist["id"],)))
+        tid = new_id("tag")
+        self.db.execute(
+            "INSERT INTO tags(id,project_id,name,definition,active,merged_into,created_at)"
+            " VALUES(?,?,?,?,1,'',?)", (tid, pid, name, definition or "", now_iso()))
+        return self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (tid,)))
+
+    def list_tags(self, pid: str, include_inactive: bool = True) -> list[dict]:
+        cond = "project_id=?" + ("" if include_inactive else " AND active=1 AND merged_into=''")
+        return [self._tag(r) for r in self.db.query(
+            f"SELECT * FROM tags WHERE {cond} ORDER BY name", (pid,))]
+
+    def merge_tag(self, tag_id: str, into_id: str) -> dict:
+        tag = self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (tag_id,)))
+        target = self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (into_id,)))
+        if tag["project_id"] != target["project_id"]:
+            raise BizError("NOT_FOUND", "合并目标不属于同一项目", status=404)
+        if tag_id == into_id:
+            raise BizError("TAG_MERGE_SELF", "标签不能合并到自身")
+        with self.db.tx() as conn:
+            conn.execute("UPDATE tags SET merged_into=?, active=0 WHERE id=?", (into_id, tag_id))
+            # 历史意见保留原标签并追加目标标签：合并关系可追溯，不重写历史
+            for r in conn.execute("SELECT id,tags_json FROM expert_feedback WHERE project_id=?",
+                                  (tag["project_id"],)).fetchall():
+                names = jloads(r["tags_json"], [])
+                if tag["name"] in names:
+                    merged = list(dict.fromkeys(names + [target["name"]]))
+                    conn.execute("UPDATE expert_feedback SET tags_json=?, updated_at=? WHERE id=?",
+                                 (json.dumps(merged, ensure_ascii=False), now_iso(), r["id"]))
+        return self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (tag_id,)))
+
+    def retire_tag(self, tag_id: str) -> dict:
+        self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (tag_id,)))
+        self.db.execute("UPDATE tags SET active=0 WHERE id=?", (tag_id,))
+        return self._tag(self.db.one("SELECT * FROM tags WHERE id=?", (tag_id,)))
+
+    def _ensure_tags(self, pid: str, names: list[str]) -> list[str]:
+        out = []
+        for n in names:
+            n = (n or "").strip()
+            if not n:
+                continue
+            row = self.db.one("SELECT id FROM tags WHERE project_id=? AND name=?", (pid, n))
+            if row is None:
+                self.add_tag(pid, n)
+            out.append(n)
+        return list(dict.fromkeys(out))
+
+    def suggest_check_aspects(self, pid: str) -> dict:
+        """把专家意见归纳为可确认的检查方面（§6.2）：按标签与严重度分组，保留原话入口。"""
+        rows = self.list(pid, statuses=["confirmed_error", "pending", "preference"])
+        by_tag: dict[str, list[dict]] = {}
+        for r in rows:
+            for t in (r["tags"] or ["未分类"]):
+                by_tag.setdefault(t, []).append(r)
+        aspects = [{"tag": t, "count": len(items),
+                    "severe": sum(1 for x in items if x["severity"] == "severe"),
+                    "samples": [{"id": x["id"], "problem": x["problem"],
+                                 "severity": x["severity"], "status": x["status"]}
+                                for x in items[:5]]}
+                   for t, items in sorted(by_tag.items())]
+        return {"aspects": aspects, "open_total": len(rows),
+                "note": "以上由系统按标签归纳，需人工确认后作为检查项使用；标签描述现象，不自动等同于原因。"}
+
+    @staticmethod
+    def _tag(r) -> dict:
+        return {"id": r["id"], "project_id": r["project_id"], "name": r["name"],
+                "definition": r["definition"], "active": bool(r["active"]),
+                "merged_into": r["merged_into"], "created_at": r["created_at"]}
+
+    def _project(self, pid: str) -> None:
+        if self.db.one("SELECT 1 FROM projects WHERE id=?", (pid,)) is None:
+            raise BizError("NOT_FOUND", "项目不存在", status=404)
+
+    def _audit(self, pid: str, action: str, target: str) -> None:
+        self.db.execute("INSERT INTO audit_log(id,actor,action,target,payload_hash,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (new_id("aud"), "system", action, f"{pid}/{target}", "", now_iso()))
+
+
+# ---------------------------------------------------------------- 评级规则与案例评级（优化1.0 §6.4/§6.5）
+
+class RatingService:
+    """自定义评级（默认ABCD）与逐案例的“点评质量评价”。
+
+    评级规则修改产生新版本，历史评价不被重新解释（§6.4）。
+    评级≠学员得分：学员得分是待检查的业务输出，评级是对AI输出质量的专家判断。
+    """
+
+    def __init__(self, db: DB | None = None):
+        self.db = db or get_db()
+
+    def create_default(self, pid: str) -> dict:
+        """ABCD 首个支持方案（§6.5）：可编辑建议，不是隐藏规则。"""
+        self._project(pid)
+        return self._insert(pid, {"levels": DEFAULT_ABCD_LEVELS,
+                                  "note": "修复原问题但出现严重新增问题时优先判为D；"
+                                          "一般问题的取舍由项目定义。始终同时展示原问题改善与新增问题两个维度。"})
+
+    def _insert(self, pid: str, payload: dict) -> dict:
+        n = self.db.one("SELECT COALESCE(MAX(version_no),0)+1 AS n FROM rating_rules"
+                        " WHERE project_id=?", (pid,))["n"]
+        rid = new_id("rul")
+        h = canonical_hash(payload)
+        self.db.execute(
+            "INSERT INTO rating_rules(id,project_id,version_no,levels_json,status,note,hash,"
+            "created_at) VALUES(?,?,?,?,'draft',?,?,?)",
+            (rid, pid, n, json.dumps(payload, ensure_ascii=False), payload.get("note", ""), h,
+             now_iso()))
+        return self.get(rid)
+
+    def get(self, rid: str) -> dict:
+        r = self.db.one("SELECT * FROM rating_rules WHERE id=?", (rid,))
+        if r is None:
+            raise BizError("NOT_FOUND", "评级规则不存在", status=404)
+        return {"id": r["id"], "project_id": r["project_id"], "version_no": r["version_no"],
+                "levels": jloads(r["levels_json"], {}).get("levels", []),
+                "note": jloads(r["levels_json"], {}).get("note", ""),
+                "status": r["status"], "hash": r["hash"], "created_at": r["created_at"]}
+
+    def list(self, pid: str) -> list[dict]:
+        return [self.get(r["id"]) for r in self.db.query(
+            "SELECT id FROM rating_rules WHERE project_id=? ORDER BY version_no", (pid,))]
+
+    def update_draft(self, rid: str, levels: list[dict], note: str = "") -> dict:
+        cur = self.get(rid)
+        if cur["status"] != "draft":
+            raise BizError("RULE_IMMUTABLE", "已发布评级规则不可覆盖；修改产生新版本", status=409)
+        self._validate_levels(levels)
+        return self._insert(cur["project_id"],
+                            {"levels": levels, "note": note or cur["note"]})
+
+    def publish(self, rid: str) -> dict:
+        cur = self.get(rid)
+        if cur["status"] == "published":
+            return cur
+        self._validate_levels(cur["levels"])
+        self.db.execute("UPDATE rating_rules SET status='published' WHERE id=?", (rid,))
+        return self.get(rid)
+
+    @staticmethod
+    def _validate_levels(levels: list[dict]) -> None:
+        if not levels:
+            raise BizError("RULE_INVALID", "评级等级不能为空")
+        codes = [str(l.get("code") or "").strip() for l in levels]
+        if len(set(codes)) != len(codes) or any(not c for c in codes):
+            raise BizError("RULE_INVALID", f"等级代码必须非空且唯一：{codes}")
+        for l in levels:
+            if l.get("trend") not in ("improved", "partial", "none", "worse", "flat", "unknown"):
+                raise BizError("RULE_INVALID",
+                               f"等级 {l.get('code')} 的趋势映射必须是 "
+                               "improved/partial/none/worse/flat/unknown（不默认把字母转为等距数字求平均）")
+
+    def submit_case_review(self, pid: str, item_id: str, rule_id: str, rating: str,
+                           resolutions: list[dict] | None = None,
+                           new_problems: list[dict] | None = None,
+                           regress_note: str = "", remark: str = "",
+                           source: str = "human") -> dict:
+        """提交一个案例的点评质量评价；人工与自动来源分别记录，不互相静默覆盖（§6.6）。"""
+        self._project(pid)
+        rule = self.get(rule_id)
+        if rule["project_id"] != pid:
+            raise BizError("NOT_FOUND", "评级规则不属于该项目", status=404)
+        if self.db.one("SELECT 1 FROM dataset_items WHERE id=? AND project_id=?",
+                       (item_id, pid)) is None:
+            raise BizError("NOT_FOUND", "案例不存在或不属于该项目", status=404)
+        valid_codes = {l["code"] for l in rule["levels"]} | set(RATING_SPECIAL)
+        if rating not in valid_codes:
+            raise BizError("RATING_INVALID", f"评级必须是 {sorted(valid_codes)} 之一")
+        if source not in ("human", "auto_suggested", "human_confirmed", "human_corrected"):
+            raise BizError("SOURCE_INVALID", "评价来源标记非法")
+        for r in (resolutions or []):
+            if r.get("status") not in RESOLUTION_STATES:
+                raise BizError("RESOLUTION_INVALID",
+                               f"问题解决状态必须是 {'/'.join(RESOLUTION_STATES)}")
+        for p in (new_problems or []):
+            if not str(p.get("description") or "").strip():
+                raise BizError("FIELD_REQUIRED", "新增问题必须给出描述")
+        cid = new_id("crv")
+        self.db.execute(
+            "INSERT INTO case_reviews(id,project_id,item_id,rule_id,rating,resolutions_json,"
+            "new_problems_json,regress_note,remark,source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (cid, pid, item_id, rule_id, rating,
+             json.dumps(resolutions or [], ensure_ascii=False),
+             json.dumps(new_problems or [], ensure_ascii=False),
+             regress_note or "", remark or "", source, now_iso()))
+        return self.get_review(cid)
+
+    def get_review(self, cid: str) -> dict:
+        r = self.db.one("SELECT * FROM case_reviews WHERE id=?", (cid,))
+        if r is None:
+            raise BizError("NOT_FOUND", "案例评级不存在", status=404)
+        return {"id": r["id"], "project_id": r["project_id"], "item_id": r["item_id"],
+                "rule_id": r["rule_id"], "rating": r["rating"],
+                "resolutions": jloads(r["resolutions_json"], []),
+                "new_problems": jloads(r["new_problems_json"], []),
+                "regress_note": r["regress_note"], "remark": r["remark"], "source": r["source"],
+                "created_at": r["created_at"]}
+
+    def list_reviews(self, pid: str, item_id: str | None = None) -> list[dict]:
+        cond, params = "project_id=?", [pid]
+        if item_id:
+            cond += " AND item_id=?"
+            params.append(item_id)
+        return [self.get_review(r["id"]) for r in self.db.query(
+            f"SELECT * FROM case_reviews WHERE {cond} ORDER BY created_at", tuple(params))]
+
+    def suggest_review(self, pid: str, item_id: str, rule_id: str,
+                       problem_statuses: dict[str, str] | None = None,
+                       new_problems: list[dict] | None = None) -> dict:
+        """按 §6.5 默认规则给出评级建议：严重新增问题优先D；无法判断单独记录。
+
+        problem_statuses: {feedback_id: fixed/partial/open/unknown}
+        """
+        rule = self.get(rule_id)
+        statuses = dict(problem_statuses or {})
+        fbs = {f["id"]: f for f in FeedbackService(self.db).list(pid, item_id=item_id)}
+        resolutions = []
+        for fid, fb in fbs.items():
+            if fid in statuses:
+                resolutions.append({"feedback_id": fid, "status": statuses[fid],
+                                    "problem": fb["problem"], "severity": fb["severity"]})
+            elif fb["status"] == "confirmed_error":
+                # 已确认但未给出核查结果：记无法判断，不默认解决（§6.5）
+                resolutions.append({"feedback_id": fid, "status": "unknown",
+                                    "problem": fb["problem"], "severity": fb["severity"]})
+        st = [r["status"] for r in resolutions]
+        severe_new = any((p.get("severity") == "severe") for p in (new_problems or []))
+        if severe_new:
+            rating = "D"
+        elif not st:
+            rating = "not_rated"
+        elif "unknown" in st:
+            rating = "cannot_judge"
+        elif all(s == "fixed" for s in st):
+            rating = "A"
+        elif all(s in ("open",) for s in st):
+            rating = "C"
+        else:
+            rating = "B"
+        basis = {"A": "全部原问题解决；新增问题需同时查看",
+                 "B": "部分原问题已解决",
+                 "C": "原问题仍未解决",
+                 "D": "出现严重新增问题，优先判D（§6.5）",
+                 "cannot_judge": "存在无法判断的问题项：单独记录，不并入等级",
+                 "not_rated": "该案例没有已登记的专家问题"}[rating]
+        return {"item_id": item_id, "rule_id": rule_id, "rating": rating,
+                "resolutions": resolutions, "new_problems": new_problems or [],
+                "basis": basis, "source": "auto_suggested",
+                "note": "建议需人工确认后生效（§6.5：不能只用一个字母，两个维度同时展示）"}
+
+    def _project(self, pid: str) -> None:
+        if self.db.one("SELECT 1 FROM projects WHERE id=?", (pid,)) is None:
+            raise BizError("NOT_FOUND", "项目不存在", status=404)
 
 
 def jloads2(db, row, key, default):

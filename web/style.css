@@ -60,3 +60,28 @@ pre { background: #f7f9fc; border: 1px solid var(--line); border-radius: 8px; pa
   border-radius: 8px; margin-bottom: 8px; align-items: baseline; background: #fff; }
 .check .dot { font-weight: 700; }
 .out-text { border-left: 3px solid var(--line); padding-left: 10px; margin: 6px 0; }
+/* 五步流程条（优化1.0 §4.2） */
+.steps { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 16px; margin-bottom: 14px; }
+.step { display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+  color: var(--muted); font-size: 13px; padding: 5px 10px; border-radius: 8px; }
+.step .mark { font-weight: 700; }
+.step.done { color: var(--ok); }
+.step.cur { background: var(--brand-soft); color: var(--brand); font-weight: 600; }
+.steps .arrow { color: #b6c2d4; }
+.card.focus { border-color: var(--brand); box-shadow: 0 1px 6px rgba(36,86,214,.08); }
+.card.round { border-left: 3px solid var(--brand-soft); }
+details > summary { cursor: pointer; color: var(--muted); margin: 6px 0; }
+/* 可用性引导（优化1.0 第一批）：价值主张 / 三段式 / 术语悬停 / 演示横幅 */
+.valueprop { border-left: 4px solid var(--brand); }
+.valueprop > p { max-width: 860px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-top: 8px; }
+@media (max-width: 900px) { .grid3 { grid-template-columns: 1fr; } }
+.vp-list { margin: 4px 0 0; padding-left: 18px; font-size: 13px; color: var(--ink); }
+.vp-list li { margin-bottom: 4px; }
+.card.intro { border-left: 4px solid var(--brand-soft); padding: 12px 16px; }
+.intro-row { display: flex; gap: 10px; padding: 3px 0; font-size: 13px; }
+.intro-k { flex: 0 0 110px; color: var(--muted); }
+.term { border-bottom: 1px dashed var(--muted); cursor: help; }
+.card.demo-banner { background: #fffaf0; border-color: #e8d5a3; }

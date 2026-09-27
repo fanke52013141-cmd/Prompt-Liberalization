@@ -153,65 +153,240 @@ def evaluate_once(output_text: str, rubric_id: str, model_config: dict, run_id: 
         return {"abstain": True, "error": "bad_json"}  # 评价坏JSON：unknown，不删分母（TC030）
 
 
-# ---------------------------------------------------------------- 优化器
+# ---------------------------------------------------------------- 优化器（优化1.0 §8）
 
-_OPT_FRAGMENT = ("输出要求：先给结论，明确判断对错并说明依据；再具体定位出错的步骤；"
-                 "最后给出可执行建议：按以下步骤修改：1) 复核定义；2) 重写该步；3) 对照核对。")
+def build_optimizer_messages(current_pv: dict, project: dict, rubric: dict,
+                             evidence: dict, history: list[dict],
+                             length_limit: int) -> list[dict]:
+    """优化器的完整输入（§8.2）：不得只发送等级、案例编号或低分维度。
+
+    包含：当前提示词与可修改范围（冻结组件单列）、任务目标与评价标准、
+    实际输入与实际输出、专家问题/标签/备注/证据、原来正确的行为与代表案例、
+    历史修改与测评结果。
+    注意 BR01：runtime 白名单之外的字段与 evaluation_only 数据（如参考答案）永不进入。
+    """
+    contract = project["contract"]
+    runtime_names = [f["name"] for f in contract.get("runtime_fields", [])]
+    frozen = current_pv.get("frozen_segments", [])
+    frozen_names = "、".join(s.get("name", "") for s in frozen) or "（无）"
+    dims = rubric.get("dimensions") or []
+    dim_lines = "\n".join(f"- {d.get('name')}（0锚点：{d.get('anchors', {}).get('0', '')}）"
+                          for d in dims) or "（未提供维度锚点）"
+    sev = rubric.get("severity_examples") or []
+
+    def fmt_input(ri: dict) -> str:
+        return "\n".join(f"  {k}：{v}" for k, v in (ri or {}).items() if k in runtime_names) or "  （无）"
+
+    fail_blocks = []
+    for f in evidence.get("failures", []):
+        fb_lines = []
+        for fb in f.get("feedback", []):
+            line = (f"  - 专家问题（{fb.get('severity', 'normal')}，状态{fb.get('status', '')}"
+                    f"，标签{'、'.join(fb.get('tags') or []) or '无'}）：{fb.get('problem')}")
+            if fb.get("quote"):
+                line += f"；专家原话：{fb['quote']}"
+            if fb.get("expected"):
+                line += f"；期望：{fb['expected']}"
+            if fb.get("remark"):
+                line += f"；备注：{fb['remark']}"
+            fb_lines.append(line)
+        fail_blocks.append(
+            f"【失败案例 {f.get('case_id')}】维度得分：{json.dumps(f.get('dims') or {}, ensure_ascii=False)}\n"
+            f"输入：\n{fmt_input(f.get('runtime_input'))}\n"
+            f"当前输出：\n{f.get('output_text', '')}\n"
+            + ("专家意见：\n" + "\n".join(fb_lines) if fb_lines else "专家意见：（该案例无登记的专家意见）"))
+    correct_blocks = [
+        f"【正确案例 {c.get('case_id')}】维度得分：{json.dumps(c.get('dims') or {}, ensure_ascii=False)}\n"
+        f"输入：\n{fmt_input(c.get('runtime_input'))}\n当前输出：\n{c.get('output_text', '')}"
+        for c in evidence.get("correct", [])]
+    hist_lines = [f"- 第{h.get('round')}轮（{h.get('decision')}）：假设={h.get('hypothesis')}；"
+                  f"结果={h.get('result')}；依据={h.get('rationale')}" for h in history]
+    goal = contract.get("goal") or "（用户未填写优化目标）"
+    sys_content = (
+        "你是提示词优化器。根据给定的失败证据修改提示词正文，并给出可验证的修改假设。\n"
+        "硬性约束：\n"
+        f"1. 冻结组件不可修改、不可删除、不可在正文中复写：{frozen_names}\n"
+        f"2. 模板变量只能使用白名单：{'、'.join(runtime_names)}；"
+        "不得引入白名单外变量或评价专用字段\n"
+        f"3. 新正文不超过{length_limit}字（当前{len(current_pv.get('body', ''))}字）："
+        "限制无依据追加与长度膨胀\n"
+        '4. 只返回JSON：{"hypothesis":"修改假设：预计解决什么、可能原因",'
+        '"new_body":"完整新正文","change_summary":"实际修改点摘要"}\n'
+        "5. 证据不足以支持修改时，new_body 原样返回并在 hypothesis 中说明。\n"
+        "6. 归因是待验证假设：资料不足、评价错误、运行故障或模型能力限制，"
+        "不应被强行解释为提示词缺陷。")
+    user_content = (
+        f"任务：{contract.get('label', '')}\n优化目标：{goal}\n"
+        f"评价标准维度（含0分锚点）：\n{dim_lines}\n"
+        + (f"严重问题示例：{'、'.join(sev)}\n" if sev else "")
+        + "\n<current_prompt>\n" + current_pv.get("body", "") + "\n</current_prompt>\n\n"
+        + ("== 失败证据（本轮为什么改）==\n" + "\n\n".join(fail_blocks)
+           if fail_blocks else "== 失败证据 ==\n（本轮无失败案例证据）")
+        + "\n\n== 必须保持的正确行为 ==\n"
+        + ("\n\n".join(correct_blocks) if correct_blocks else "（暂无正确案例记录）")
+        + "\n\n== 历史修改与测评结果 ==\n"
+        + ("\n".join(hist_lines) if hist_lines else "（第一轮，无历史）"))
+    return [{"role": "system", "content": sys_content},
+            {"role": "user", "content": user_content}]
 
 
-def propose_fragment(db: DB, model_config: dict, failures: list[dict], run_id: str,
-                     budget: BudgetState, ledger: Ledger) -> str:
-    """反思：由失败证据提出改写片段（GEPA 式 reflect 接口的本地实现）。"""
-    if not failures:
-        return _OPT_FRAGMENT
-    flat = "\n".join(f"案例 {f.get('case')}: 低分维度 {f.get('dims')}" for f in failures[:5])
-    messages = [{"role": "user", "content":
-                 "以下是当前提示词在开发集上的失败摘要，请提出一段可直接追加的输出要求片段。\n" + flat}]
+def propose_revision(db: DB, model_config: dict, current_pv: dict, project: dict,
+                     rubric: dict, evidence: dict, history: list[dict],
+                     run_id: str, budget: BudgetState, ledger: Ledger,
+                     length_limit: int = 4000) -> dict:
+    """由完整证据提出改写（GEPA 式 reflect 的本地实现）。
+
+    改写失败（调用失败/坏JSON/空正文/超长）明确报告，绝不静默追加固定业务文本
+    充当成功结果（§8.6）；返回 {"ok": bool, ...}。
+    """
+    messages = build_optimizer_messages(current_pv, project, rubric, evidence, history, length_limit)
     try:
         result = call_model(db, "optimizer", model_config, messages, {}, run_id,
                             new_id("lrq"), "search", budget, ledger)
+    except ProviderError as e:
+        return {"ok": False, "reason": f"改写失败：优化模型调用失败（{e.code}），本轮未产生候选"}
+    if result.finish != "stop":
+        return {"ok": False, "reason": "改写失败：优化模型输出被截断，本轮未产生候选"}
+    try:
         data = json.loads(result.text)
-        frag = data.get("fragment_suggestion")
-        if frag:
-            return str(frag)
-    except (ProviderError, ValueError, KeyError):
-        pass
-    return _OPT_FRAGMENT
+        new_body = str(data["new_body"])
+        hypothesis = str(data.get("hypothesis", ""))
+        change_summary = str(data.get("change_summary", ""))
+    except (ValueError, KeyError, TypeError):
+        return {"ok": False,
+                "reason": "改写失败：优化模型未返回约定的JSON结构（hypothesis/new_body），"
+                          "本轮未产生候选；未使用任何兜底文本"}
+    if not new_body.strip():
+        return {"ok": False, "reason": "改写失败：优化模型返回空正文，本轮未产生候选"}
+    if len(new_body) > length_limit:
+        return {"ok": False, "reason": f"改写失败：新正文 {len(new_body)} 字超过长度上限 "
+                                       f"{length_limit} 字（控制无依据膨胀，§8.6），本轮未产生候选"}
+    return {"ok": True, "hypothesis": hypothesis, "new_body": new_body,
+            "change_summary": change_summary, "length": len(new_body)}
+
+
+def check_problems(db: DB, problems: list[dict], output_text: str, model_config: dict,
+                   run_id: str, phase: str, budget: BudgetState, ledger: Ledger) -> dict:
+    """对一份输出逐项核查专家问题是否仍存在：resolved/partial/unresolved/unknown。
+
+    需要语义理解，因此使用自动判定并接受专家核对（§6.6）；失败记 unknown，不静默当已解决。
+    """
+    if not problems:
+        return {"statuses": {}, "abstain": False}
+    plines = "\n".join(f"- id={p['id']}：{p['problem']}"
+                       + (f"（期望：{p.get('expected')}）" if p.get("expected") else "")
+                       for p in problems)
+    messages = [
+        {"role": "system", "content":
+            "你是问题核查判定者。对照以下专家问题逐项检查输出是否仍存在该问题。\n"
+            "只返回JSON：{\"problems\":[{\"id\":\"...\",\"status\":\"resolved|partial|"
+            "unresolved|unknown\",\"note\":\"判定依据\"}]}。\n" + plines},
+        {"role": "user", "content": f"<problem_check>\n<output>\n{output_text}\n</output>"},
+    ]
+    try:
+        result = call_model(db, "evaluation", model_config, messages, {}, run_id,
+                            new_id("lrq"), phase, budget, ledger)
+    except ProviderError as e:
+        return {"statuses": {p["id"]: "unknown" for p in problems},
+                "abstain": True, "error": e.code}
+    try:
+        data = json.loads(result.text)
+        valid = ("resolved", "partial", "unresolved", "unknown")
+        out = {}
+        for entry in data.get("problems", []):
+            pid = str(entry.get("id", ""))
+            if pid in {p["id"] for p in problems} and entry.get("status") in valid:
+                out[pid] = entry["status"]
+        for p in problems:  # 缺项记 unknown：不删除分母（TC030 口径）
+            out.setdefault(p["id"], "unknown")
+        return {"statuses": out, "abstain": False}
+    except Exception:
+        return {"statuses": {p["id"]: "unknown" for p in problems},
+                "abstain": True, "error": "bad_json"}
 
 
 def score_prompt(db: DB, project: dict, prompt_version: dict, item_ids: list[str],
                  rubric_id: str, eval_model: dict, run_id: str, phase: str,
                  budget: BudgetState, ledger: Ledger) -> dict:
-    """在固定样本上生成+评价，返回 {score, usable_rate, n, n_scored, severe, failures}。"""
-    data_svc = None
+    """在固定样本上生成+评价，返回汇总与逐案例明细（供回退检查与证据追溯）。"""
     from .domain import DataService
     data_svc = DataService(db)
     scores, usable, n, n_scored, severe, failures = [], 0, 0, 0, 0, []
+    items_detail = []
     for iid in item_ids:
         item = data_svc.get_item_runtime(project["id"], iid)
         gen = generate_once(db, project, prompt_version, item, eval_model.get("generation")
                             if isinstance(eval_model, dict) and "generation" in eval_model
                             else eval_model, run_id, phase, budget, ledger)
         n += 1
+        entry = {"item_id": iid, "case_id": item["case_id"], "output_id": gen["id"],
+                 "gen_status": gen["status"], "score": None, "usable": None,
+                 "severe": None, "eval_abstain": True, "dims": {}}
         if gen["status"] != "ok":
+            items_detail.append(entry)
             continue  # 失败/截断计入分母但不得分：unknown 不删分母（TC030）
         out_row = db.one("SELECT text FROM outputs WHERE id=?", (gen["id"],))
+        entry["output_text"] = out_row["text"]
         ev_model = eval_model.get("evaluation") if isinstance(eval_model, dict) and \
             "evaluation" in eval_model else eval_model
         scored = evaluate_once(out_row["text"], rubric_id, ev_model, run_id, phase)
         if scored.get("abstain"):
+            items_detail.append(entry)
             continue
         n_scored += 1
         vals = list(scored["scores"].values())
         s = sum(vals) / len(vals) if vals else 0.0
         scores.append(s)
+        entry["score"] = s
+        entry["dims"] = scored["scores"]
+        entry["eval_abstain"] = False
         from .providers import has_severe_error, is_usable
-        if is_usable(scored):
+        u = is_usable(scored)
+        entry["usable"] = u
+        sv = has_severe_error(out_row["text"], scored)
+        entry["severe"] = sv
+        if u:
             usable += 1
-        if has_severe_error(out_row["text"], scored):
+        if sv:
             severe += 1
-            failures.append({"case": item["case_id"], "dims": [k for k, v in
-                             scored["scores"].items() if v <= 1]})
+            failures.append({"case": item["case_id"], "item_id": iid,
+                             "dims": [k for k, v in scored["scores"].items() if v <= 1]})
+        items_detail.append(entry)
     return {"score": (sum(scores) / len(scores)) if scores else 0.0,
             "usable_rate": usable / n if n else 0.0, "n": n, "n_scored": n_scored,
-            "severe": severe, "failures": failures}
+            "severe": severe, "failures": failures, "items": items_detail,
+            "length": len(prompt_version.get("body", ""))}
+
+
+def decide_keep(prev: dict, cand: dict, min_delta: float) -> dict:
+    """保留决定（§8.6）：比较主要目标、底线与代价，不只比较平均分。
+
+    底线：原有正确案例不得回退；严重错误不得增加。归因与依据写入 rationale。
+    """
+    regressions = cand.get("regressions", 0)
+    severe_delta = (cand.get("severe") or 0) - (prev.get("severe") or 0)
+    score_gain = (cand.get("score") or 0.0) - (prev.get("score") or 0.0)
+    fixed = cand.get("fixed_problems", 0)
+    open_before = cand.get("open_problems_before", 0)
+    if score_gain > min_delta and regressions == 0 and severe_delta <= 0:
+        decision, rationale = "kept", (
+            f"平均分 {prev.get('score'):.3f}→{cand.get('score'):.3f}（+{score_gain:.3f}，"
+            f"超过阈值{min_delta}）；专家问题解决 {fixed}/{open_before}；"
+            f"原有正确案例回退 {regressions} 条；严重错误 {prev.get('severe')}→{cand.get('severe')}；"
+            f"长度 {prev.get('length')}→{cand.get('length')} 字：超过阈值且无回退，保留为新最优")
+    elif regressions > 0:
+        decision, rationale = "discarded", (
+            f"平均分 {prev.get('score'):.3f}→{cand.get('score'):.3f}，但原有正确案例回退 "
+            f"{regressions} 条：底线被破坏，淘汰（§8.6 防止越改越差）")
+    elif severe_delta > 0:
+        decision, rationale = "discarded", (
+            f"严重错误 {prev.get('severe')}→{cand.get('severe')}：严重问题不能由其他高分抵消，淘汰")
+    elif score_gain <= min_delta:
+        decision, rationale = "discarded", (
+            f"平均分 {prev.get('score'):.3f}→{cand.get('score'):.3f}（+{score_gain:.3f}，"
+            f"未超过阈值{min_delta}），问题解决 {fixed}/{open_before}：改善不足以抵消变化成本，淘汰")
+    else:
+        decision, rationale = "discarded", "未通过保留条件，淘汰"
+    return {"decision": decision, "rationale": rationale,
+            "score_gain": score_gain, "regressions": regressions,
+            "severe_delta": severe_delta}

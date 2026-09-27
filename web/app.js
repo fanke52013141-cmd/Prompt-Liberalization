@@ -1,9 +1,20 @@
-/* 提示词优化实验室 本地版界面。
+/* 提示词优化实验室 本地版界面（优化1.0）。
+   主线为五步流程：准备材料 → 确认怎么评 → 原始测评 → 自动优化 → 验证与使用；
+   原内部模块（标注/评价器/实验配置等）归入"高级功能"。
    所有动态内容经 esc() 转义后渲染（TC051：恶意HTML不执行）。 */
 "use strict";
 
 const API = "/workflow-api/v1";
 const state = { projects: [], pid: null, templates: {} };
+const FLOW_STEPS = [
+  { key: "prepare", name: "准备材料", page: "materials" },
+  { key: "confirm_eval", name: "确认怎么评", page: "evaluate" },
+  { key: "baseline", name: "原始测评", page: "baseline" },
+  { key: "optimize", name: "自动优化", page: "optimize" },
+  { key: "verify", name: "验证与使用", page: "verify" },
+];
+const FLOW_PAGE = Object.fromEntries(FLOW_STEPS.map(s => [s.key, s.page]));
+const PAGES = {};
 
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g,
@@ -28,125 +39,1073 @@ function toast(msg, isErr) {
   clearTimeout(t._h); t._h = setTimeout(() => t.classList.add("hidden"), 5200);
 }
 function pill(text, cls) { return `<span class="pill ${cls || ""}">${esc(text)}</span>`; }
+function errText(e) {
+  const fe = e.body && e.body.field_errors
+    ? "\n" + Object.entries(e.body.field_errors).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
+  return e.message + fe;
+}
+
+/* ---------------- 术语：页面内虚线词悬停即解释 + 名词解释页 ---------------- */
+const GLOSSARY = [
+  ["项目", "长期优化的一件事，比如“学员作答点评”。一个项目可以反复优化多次，材料和规则可以复用。"],
+  ["输入字段", "每次调用 AI 时要提供给它的信息（题目、学员答案…）。提示词里用 {{字段名}} 引用。"],
+  ["评价专用字段", "只给评价用的资料（参考答案、专家批注…）。系统保证它们永远不会发给执行 AI，防止它抄答案。"],
+  ["优化目标", "你现在最不满意的地方、希望改善的方向。自由描述即可，随时可改。"],
+  ["基线", "你当前正在用的提示词版本，是所有比较的起点。"],
+  ["候选", "系统改写出的新版本提示词。只有通过底线检查（原来会的不能变差、严重错误不能增加）才会被保留。"],
+  ["保留 / 淘汰", "每轮改写后系统的取舍决定，都会写出具体依据（提升多少、有没有回退），可追溯。"],
+  ["开发集", "系统反复用来测试和改写的案例，相当于“练习题”。"],
+  ["封存测试集", "修改期间系统接触不到的案例，相当于“考题”；最后用来独立验证，防止只是背会了练习题。"],
+  ["冻结切分", "把案例分组锁定：同一来源的案例不会既当练习题又当考题，保证检验公正。锁定后不可更改。"],
+  ["评价标准", "“怎样算好”的具体规定：检查哪些维度、0-3 分各代表什么。由你确认后发布，修改会产生新版本。"],
+  ["评价器", "按评价标准给输出打分的模型或流程。标准或模型变化后会标记为过期，需重新校准才能批量使用。"],
+  ["专家意见", "人工指出的具体问题（保留原话与期望表现），是优化最直接的依据。"],
+  ["ABCD 评级", "单个案例的改善分级：A 原问题全部解决 / B 部分解决 / C 没解决 / D 出现新问题。可自定义。"],
+  ["原始测评", "优化前先把基线完整测一遍，得到带证据的问题清单，作为改进起点。"],
+  ["独立验证", "用封存测试集做的最终检验。通过才有“验证有效”；没通过或证据不足都会如实显示。"],
+  ["账本与预算", "每次模型调用的用量记录。预算耗尽自动暂停（不占用独立验证的预留额度）；内置模拟供应商不花钱。"],
+  ["演示模式", "内置离线模拟供应商：不用 API Key 就能跑通全部流程，结果为演示性质，不代表真实模型效果。"],
+];
+function term(k) {
+  const d = GLOSSARY.find(g => g[0] === k);
+  return `<span class="term" title="${esc(d ? d[1] : k)}">${esc(k)}</span>`;
+}
+function pageGlossary() {
+  setMain(`<h1>名词解释</h1>
+  <p class="sub">每个词两句话：它是什么，为什么需要。页面里的<span class="term" title="像这样：鼠标放上来就能看到解释。">虚线词</span>悬停即可看解释。</p>`
+    + GLOSSARY.map(([k, v]) =>
+      `<div class="card"><b>${esc(k)}</b><div class="small" style="margin-top:4px">${esc(v)}</div></div>`).join(""));
+}
 
 /* ---------------- 导航 ---------------- */
-const PROJECT_PAGES = [
-  ["overview", "P02 总览与准备度"], ["data", "P03 案例与数据集"], ["rubric", "P04 评价标准"],
-  ["annotation", "P05/P06 人工标注"], ["judge", "P07 评价器校准"], ["prompts", "P08 提示词库"],
-  ["playground", "P09 编辑与试运行"], ["experiment", "P10 实验配置"], ["runs", "P11 实验运行"],
-  ["acceptance", "P12 独立验收"], ["usage", "P13 使用与反馈"], ["settings", "P14 设置"],
+const ADV_PAGES = [
+  ["data", "案例与数据"], ["rubric", "评价标准"], ["annotation", "人工标注"],
+  ["judge", "评价器校准"], ["prompts", "提示词库"], ["playground", "试运行"],
+  ["experiment", "实验配置"], ["runs", "运行记录"], ["acceptance", "验收报告"],
+  ["usage", "使用与反馈"],
 ];
 function renderNav() {
   const h = location.hash || "#/projects";
-  let html = `<a href="#/projects" class="${h === "#/projects" || h.startsWith("#/proj/") ? "active" : ""}">P01 项目列表</a>`;
+  let html = `<a href="#/projects" class="${h === "#/projects" || h.startsWith("#/proj/") ? "active" : ""}">项目列表</a>`;
   if (state.pid) {
-    html += `<div class="group">当前项目</div>`;
-    for (const [key, label] of PROJECT_PAGES) {
+    html += `<div class="group">优化流程</div>`;
+    for (const s of FLOW_STEPS) {
+      const active = h === `#/proj/${state.pid}/${s.page}` ? "active" : "";
+      html += `<a href="#/proj/${state.pid}/${s.page}" class="${active}">${esc(s.name)}</a>`;
+    }
+    html += `<a href="#/proj/${state.pid}/home" class="${h.endsWith("/home") ? "active" : ""}">项目主页</a>`;
+    html += `<div class="group">高级功能</div>`;
+    for (const [key, label] of ADV_PAGES) {
       const active = h === `#/proj/${state.pid}/${key}` ? "active" : "";
       html += `<a href="#/proj/${state.pid}/${key}" class="${active}">${esc(label)}</a>`;
     }
   }
+  html += `<div class="group">系统</div><a href="#/settings" class="${h === "#/settings" ? "active" : ""}">模型设置</a>`
+    + `<a href="#/glossary" class="${h === "#/glossary" ? "active" : ""}">名词解释</a>`;
   document.getElementById("nav").innerHTML = html;
 }
-function nav() { renderNav(); }
 
-/* ---------------- 路由 ---------------- */
+/* ---------------- 路由（§12：运行/版本/报告均可恢复直达） ---------------- */
 async function route() {
   const h = location.hash || "#/projects";
-  const m = h.match(/^#\/proj\/([^/]+)\/([^/]+)$/);
+  let m = h.match(/^#\/proj\/([^/]+)\/run\/([^/]+)$/);
+  if (m) { state.pid = m[1]; await pageRunDetail(m[2]); renderNav(); return; }
+  m = h.match(/^#\/proj\/([^/]+)\/([^/]+)$/);
   if (m) { state.pid = m[1]; await pageProject(m[2]); }
+  else if (h === "#/settings") { state.pid = null; await pageSettingsGlobal(); }
+  else if (h === "#/glossary") { state.pid = null; pageGlossary(); }
   else { state.pid = null; await pageProjects(); }
   renderNav();
   window.scrollTo(0, 0);
 }
 function setMain(html) { document.getElementById("main").innerHTML = html; }
 
-/* ---------------- P01 项目列表 ---------------- */
+/* ---------------- 项目列表（显示真实状态与下一步 §4.1） ---------------- */
 async function pageProjects() {
-  const [pr, tpl] = await Promise.all([api("GET", "/projects"), api("GET", "/templates")]);
-  state.projects = pr.projects; state.templates = tpl;
-  const cards = pr.projects.map(p => `
+  const [pr] = await Promise.all([api("GET", "/projects"), api("GET", "/templates")]);
+  state.projects = pr.projects;
+  const hasDemo = pr.projects.some(p => p.name.startsWith("示例："));
+  const cards = [];
+  for (const p of pr.projects) {
+    let step = "";
+    try {
+      const prog = await api("GET", `/projects/${p.id}/progress`);
+      const cur = prog.steps.find(s => s.key === prog.current) || prog.steps[0];
+      step = `<div class="muted small">下一步：${esc(cur.action)}（${esc(cur.explain)}）</div>`;
+    } catch (e) { /* 显示基础信息 */ }
+    cards.push(`
     <div class="card">
       <div class="flex">
         <div style="flex:2">
-          <b>${esc(p.name)}</b> ${pill(esc(p.task_type), "brand")}
+          <b>${esc(p.name)}</b> ${pill(esc(p.contract.label || p.task_type), "brand")}
+          ${p.name.startsWith("示例：") ? pill("演示", "warn") : ""}
           ${p.status === "archived" ? pill("已归档", "warn") : pill("使用中", "ok")}
           <div class="muted small">${esc(p.description || "")} · 创建于 ${esc(p.created_at)}</div>
-          <div class="muted small">任务单位：${esc(p.contract.evaluation_unit || "")}</div>
+          ${step}
         </div>
         <div style="flex:0">
           <button onclick="openProject('${p.id}')">进入</button>
           ${p.status === "archived"
             ? `<button class="grey" onclick="unarchive('${p.id}')">取消归档</button>`
             : `<button class="grey" onclick="archive('${p.id}')">归档</button>`}
+          <button class="danger" onclick="deleteProject('${p.id}')">删除</button>
         </div>
       </div>
-    </div>`).join("") || `<div class="card empty">还没有项目，先创建一个。</div>`;
-  const opts = Object.entries(tpl).map(([k, t]) =>
-    `<option value="${esc(k)}">${esc(t.label)}（${esc(k)}）</option>`).join("");
+    </div>`);
+  }
+  const tplOpts = [["student_feedback", "学员作答点评"], ["question_explain", "题目解析"],
+    ["article_title", "公众号标题"], ["article_framework", "文章框架"]]
+    .map(([k, label]) => `<option value="${k}">${esc(label)}（可选示例）</option>`).join("");
   setMain(`
-    <h1>P01 项目列表与创建</h1>
-    <p class="sub">每个项目绑定一种任务契约：不能把点评和标题混成一个评分项目。</p>
-    ${cards}
-    <div class="card">
+    <h1>提示词优化实验室</h1>
+    <div class="card valueprop">
+      <b>这个工具帮你做什么</b>
+      <p style="margin:6px 0">你有一段正在用的提示词（比如让 AI 点评学员作业），但输出总在某些地方不满意。
+      把它交给本系统，再给几个真实案例，系统会：<b>先测现状 → 按你确认的标准自动尝试修改 → 用没参与修改的新案例验证是否真的变好</b>。
+      最后你拿走一段改进后的提示词，和一份说明“改了什么、效果如何、证据是什么”的报告。</p>
+      <div class="grid3">
+        <div><b>它会</b><ul class="vp-list">
+          <li>先测出提示词现在的水平</li>
+          <li>按<b>你确认的</b>标准自动改写、测试、取舍</li>
+          <li>守住底线：原来会的不能变差</li>
+          <li>用“考题”独立检验，如实报告结论</li></ul></div>
+        <div><b>它不会</b><ul class="vp-list">
+          <li>不保证一定变好——没提升会如实说“未见提升，保留原版”</li>
+          <li>不偷改你的成功标准</li>
+          <li>不把参考答案泄露给执行 AI</li>
+          <li>不用“背会练习题”冒充真的有效</li></ul></div>
+        <div><b>你要准备</b><ul class="vp-list">
+          <li>正在用的提示词原文</li>
+          <li>几条真实案例（有专家指过问题的最好）</li>
+          <li>一句话说明最不满意什么</li></ul></div>
+      </div>
+      <div style="margin-top:10px">
+        <button id="demo-btn" onclick="openDemo()">${hasDemo ? "打开示例项目" : "看一遍示例（约1分钟，用演示数据，不花钱）"}</button>
+        <button class="ghost" onclick="focusCreate()">直接用我的真实材料开始 ↓</button>
+        <span class="muted small">不确定怎么用？先看示例：里面材料、专家意见、优化过程、验证报告全是现成的。</span>
+      </div>
+    </div>
+    <h2 style="font-size:15px">我的项目</h2>
+    ${cards.join("") || `<div class="card empty">还没有项目。先看一遍示例，或在下面用真实材料创建第一个。</div>`}
+    <div class="card" id="create-card">
       <b>新建项目</b>
+      <p class="muted small">创建后进入第一步“准备材料”；任务模板只是可选示例，推荐自定义任务——只填几个输入框，结构由系统自动拼装。</p>
       <div class="flex">
         <div><label>项目名称</label><input id="np-name" placeholder="例如：初中学员点评优化"></div>
-        <div><label>任务模板</label><select id="np-task">${opts}</select></div>
+        <div><label>任务来源</label><select id="np-source" onchange="npSourceChanged()">
+          <option value="custom">自定义任务（推荐）</option>
+          <option value="template">从示例模板开始</option></select></div>
       </div>
-      <label>描述</label><input id="np-desc" placeholder="目标用户与业务目标（可空）">
-      <div style="margin-top:10px"><button onclick="createProject()">创建项目</button>
-      <span class="muted small">模板自带输入契约与评价标准草案（演示数据标识 is_demo）</span></div>
+      <div id="np-custom">
+        <div class="flex">
+          <div><label>任务名称（如：学员作答点评）</label><input id="np-label" placeholder="你想优化的一件事"></div>
+          <div><label>评价单位</label><input id="np-unit" placeholder="如：一份完整点评"></div>
+        </div>
+        <div class="muted small" style="margin-top:10px"><b>① 输入字段</b>——每次调用 AI 时要提供给它的信息。
+          提示词里用 <code>{{字段名}}</code> 引用，例如：请点评 {{题目}} 与 {{学员答案}}。</div>
+        <div id="np-runtime-rows"></div>
+        <button class="grey" onclick="npAddField('runtime')">＋ 添加输入字段</button>
+        <div class="muted small" style="margin-top:12px"><b>② 评价专用字段（选填）</b>——只给“评价/检查”用的资料，
+          例如参考答案、专家批注。系统保证它们<b>永远不会发给执行模型</b>，避免 AI 抄参考答案。</div>
+        <div id="np-eval-rows"></div>
+        <button class="grey" onclick="npAddField('eval')">＋ 添加评价专用字段</button>
+        <details style="margin-top:8px"><summary>预览：系统会自动把上面的输入框拼装成以下任务结构（无需手写）</summary>
+          <pre id="np-preview"></pre></details>
+      </div>
+      <div id="np-template" class="hidden">
+        <div class="flex"><div><label>示例模板</label><select id="np-task">${tplOpts}</select></div></div>
+        <p class="muted small">模板自带输入契约与评价标准草案（演示数据标识 is_demo），创建后可调整。</p>
+      </div>
+      <label>优化目标（当前主要问题、希望改善的地方，可随时修改）</label>
+      <textarea id="np-goal" style="min-height:60px" placeholder="例如：列式正确但计算错误时，点评经常错误归因为概念不清，希望准确区分。"></textarea>
+      <div style="margin-top:10px"><button onclick="createProject()">创建项目</button></div>
     </div>`);
+  npSeedRows();
+  npUpdatePreview();
+}
+function npSourceChanged() {
+  const v = document.getElementById("np-source").value;
+  document.getElementById("np-custom").classList.toggle("hidden", v !== "custom");
+  document.getElementById("np-template").classList.toggle("hidden", v === "custom");
+  if (v === "custom") { npSeedRows(); npUpdatePreview(); }
+}
+async function openDemo() {
+  const btn = document.getElementById("demo-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "正在生成示例（几秒钟）…"; }
+  try {
+    const r = await api("POST", "/demo/seed");
+    toast(r.created ? "示例项目已生成：材料、专家意见、优化与报告都是现成的" : "示例项目已存在，直接打开");
+    location.hash = `#/proj/${r.project_id}/home`;
+  } catch (e) {
+    toast(errText(e), true);
+    if (btn) { btn.disabled = false; btn.textContent = "看一遍示例（约1分钟，用演示数据，不花钱）"; }
+  }
+}
+function focusCreate() {
+  const el = document.getElementById("np-name");
+  if (el) { el.scrollIntoView({ behavior: "smooth", block: "center" }); el.focus(); }
+}
+/* 字段行编辑器：用户只填输入框，系统自动拼装成任务结构（§5.2 易用性） */
+function npFieldRow(kind, label, name) {
+  return `<div class="flex np-row" data-kind="${kind}" style="margin-top:6px">
+    <div><label>显示名</label><input class="np-label" value="${esc(label || "")}" placeholder="如：学员答案"
+      oninput="npUpdatePreview()"></div>
+    <div><label>字段名（提示词中写 {{字段名}}；留空则按显示名自动生成）</label>
+      <input class="np-name" value="${esc(name || "")}" placeholder="如：student_answer"
+      oninput="npUpdatePreview()"></div>
+    <div style="flex:0 0 110px"><label>类型</label><select class="np-type">
+      <option value="text">文本</option><option value="enum">枚举</option>
+      <option value="integer">整数</option><option value="number">数字</option></select></div>
+    <div style="flex:0 0 64px"><label> </label>
+      <button class="grey" onclick="this.closest('.np-row').remove();npUpdatePreview()">删除</button></div>
+  </div>`;
+}
+function npAddField(kind, label, name) {
+  const box = document.getElementById(kind === "runtime" ? "np-runtime-rows" : "np-eval-rows");
+  box.insertAdjacentHTML("beforeend", npFieldRow(kind, label, name));
+  npUpdatePreview();
+}
+function npSeedRows() {
+  const rt = document.getElementById("np-runtime-rows");
+  const ev = document.getElementById("np-eval-rows");
+  if (!rt.children.length) {
+    rt.innerHTML = npFieldRow("runtime", "题目", "question") + npFieldRow("runtime", "学员答案", "student_answer");
+  }
+  if (!ev.children.length) {
+    ev.innerHTML = npFieldRow("eval", "参考答案", "expert_answer");
+  }
+}
+function npCollectFields(kind) {
+  const rows = [...document.querySelectorAll(`.np-row[data-kind="${kind}"]`)];
+  const out = [];
+  for (const row of rows) {
+    const label = row.querySelector(".np-label").value.trim();
+    let name = row.querySelector(".np-name").value.trim();
+    if (!label && !name) continue;  // 空行忽略
+    if (!name) name = label.replace(/[\s{}"'，,：:]/g, "") || `字段${out.length + 1}`;
+    const bad = /[\s{}"'，,：:]/.test(name);
+    if (bad) throw new Error(`字段名「${name}」不能包含空格、花括号、逗号或冒号；请修改后重试`);
+    out.push({ name, label: label || name, type: row.querySelector(".np-type").value });
+  }
+  return out;
+}
+function npUpdatePreview() {
+  const el = document.getElementById("np-preview");
+  if (!el) return;
+  try {
+    const structure = {
+      任务: document.getElementById("np-label").value || "（任务名称）",
+      输入字段_交给执行模型: npCollectFields("runtime").map(f => `${f.name}(${f.label})`),
+      评价专用字段_绝不发给执行模型: npCollectFields("eval").map(f => `${f.name}(${f.label})`),
+    };
+    el.textContent = JSON.stringify(structure, null, 2);
+  } catch (e) { el.textContent = e.message; }
 }
 async function createProject() {
   const name = document.getElementById("np-name").value.trim();
   if (!name) { toast("项目名称不能为空", true); return; }
-  const p = await api("POST", "/projects", {
-    name, description: document.getElementById("np-desc").value,
-    task_type: document.getElementById("np-task").value });
-  toast("项目已创建：" + p.id);
-  location.hash = `#/proj/${p.id}/overview`;
+  const source = document.getElementById("np-source").value;
+  const goal = document.getElementById("np-goal").value;
+  const body = { name, description: "", goal };
+  if (source === "custom") {
+    let runtime, evaluation;
+    try {
+      runtime = npCollectFields("runtime");
+      evaluation = npCollectFields("eval");
+    } catch (e) { toast(e.message, true); return; }
+    if (!runtime.length) { toast("至少添加一个输入字段（AI 每次需要看到的信息）", true); return; }
+    const dup = runtime.find(f => evaluation.some(x => x.name === f.name));
+    if (dup) { toast(`字段「${dup.name}」不能同时作为输入字段和评价专用字段`, true); return; }
+    body.task_type = "custom";
+    body.contract = {
+      label: document.getElementById("np-label").value.trim() || name,
+      runtime_fields: runtime,
+      evaluation_fields: evaluation,
+      evaluation_unit: document.getElementById("np-unit").value.trim() || "一份完整输出",
+    };
+  } else {
+    body.task_type = document.getElementById("np-task").value;
+  }
+  try {
+    const p = await api("POST", "/projects", body);
+    toast("项目已创建");
+    location.hash = `#/proj/${p.id}/home`;
+  } catch (e) { toast(errText(e), true); }
 }
-function openProject(id) { location.hash = `#/proj/${id}/overview`; }
+function openProject(id) { location.hash = `#/proj/${id}/home`; }
+async function deleteProject(id) {
+  const p = (state.projects || []).find(x => x.id === id);
+  if (!confirm(`确定删除项目「${p ? p.name : id}」？\n项目下的案例、运行、报告将一并删除，不可恢复。`)) return;
+  try {
+    await api("DELETE", `/projects/${id}`);
+    toast("项目已删除");
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
 async function archive(id) { await api("POST", `/projects/${id}/archive`); toast("已归档：历史可读，新收费运行将被拒绝"); route(); }
 async function unarchive(id) { await api("POST", `/projects/${id}/unarchive`); toast("已恢复"); route(); }
 
-/* ---------------- P02 总览与准备度 ---------------- */
+/* ---------------- 项目页头与五步流程条（§4.2） ---------------- */
 async function pageProject(page) {
   const p = await api("GET", `/projects/${state.pid}`);
-  const head = `<h1>${esc(p.name)}</h1>
-    <p class="sub">${pill(esc(p.task_type), "brand")} ${p.status === "archived" ? pill("已归档", "warn") : ""}
-    ${esc(p.contract.evaluation_unit || "")} · 主指标：${esc(p.contract.primary_metric || "")}</p>`;
-  const fn = PAGES[page] || PAGES.overview;
+  const head = `<div class="flex" style="align-items:baseline">
+      <div style="flex:1"><h1>${esc(p.name)}</h1>
+      <p class="sub">${pill(esc(p.contract.label || p.task_type), "brand")}
+      ${p.status === "archived" ? pill("已归档", "warn") : ""}
+      ${esc(p.contract.evaluation_unit || "")}</p></div>
+      <div style="flex:0"><a class="small" href="#/projects">← 返回项目列表</a></div></div>`
+    + (p.name.startsWith("示例：")
+      ? `<div class="card demo-banner"><b>这是一个演示项目</b>：<span class="small">所有数据由内置模拟供应商生成，均为演示性质。
+        材料是现成的、优化已跑完、报告已生成——随便点开每一步看懂流程，然后用「新建项目」换成你的真实材料。</span></div>`
+      : "");
+  const fn = PAGES[page];
+  if (!fn) { setMain(head + `<div class="card empty">页面不存在：<b>${esc(page)}</b>。请从左侧菜单选择。</div>`); return; }
   const body = await fn(p);
   setMain(head + body);
 }
-const PAGES = {};
-PAGES.overview = async (p) => {
-  const r = await api("GET", `/projects/${p.id}/readiness`);
-  const rows = r.checks.map(c => `
-    <div class="check">
-      <span class="dot" style="color:${c.ready ? "var(--ok)" : "var(--warn)"}">${c.ready ? "✓" : "○"}</span>
-      <span style="flex:1">${esc(c.explain)}</span>
-      <span class="muted small">补齐页面：${esc(c.page)}</span>
-      <a href="#/proj/${p.id}/${pageKey(c.page)}" class="small">前往</a>
-    </div>`).join("");
-  const stateNote = r.state === "experiment_ready"
-    ? pill("experiment_ready 可发起批量实验", "ok")
-    : pill("当前状态：" + r.state, "warn");
-  return `<div class="card"><b>P02 项目总览与引导工作台</b> ${stateNote}
-    <p class="muted small">准备状态由依赖计算；缺少项逐条解释并跳转补齐页，不显示虚假就绪（TC004）。
-    评价器未校准时可退回人工评价继续探索；探索结果标注"探索，未验证"，不允许伪造提升结论。</p>
-    ${rows}</div>`;
-};
-function pageKey(pid) {
-  return { P01: "overview", P02: "overview", P03: "data", P04: "rubric", P05: "annotation",
-    P06: "annotation", P07: "judge", P08: "prompts", P09: "playground", P10: "experiment",
-    P11: "runs", P12: "acceptance", P13: "usage", P14: "settings" }[pid] || "overview";
+async function getProgress(pid) { return api("GET", `/projects/${pid}/progress`); }
+function stepBar(progress, pid) {
+  return `<div class="steps">` + FLOW_STEPS.map(s => {
+    const st = progress.steps.find(x => x.key === s.key) || {};
+    const mark = st.done ? "✓" : (progress.current === s.key ? "●" : "○");
+    const cls = st.done ? "done" : (progress.current === s.key ? "cur" : "");
+    return `<a class="step ${cls}" href="#/proj/${pid}/${s.page}" title="${esc(st.why || "")}"><span class="mark">${mark}</span>${esc(s.name)}</a>`;
+  }).join(`<span class="arrow">→</span>`) + `</div>`;
+}
+/* 三段式引导：这一步解决什么 / 你要提供什么 / 做完之后（§1.2 每步说明目的与结果） */
+function flowIntro(what, provide, then) {
+  return `<div class="card intro">
+    <div class="intro-row"><span class="intro-k">这一步解决什么</span><span>${what}</span></div>
+    <div class="intro-row"><span class="intro-k">你现在要做的</span><span>${provide}</span></div>
+    <div class="intro-row"><span class="intro-k">做完之后</span><span>${then}</span></div>
+  </div>`;
 }
 
-/* ---------------- P03 数据 ---------------- */
+/* ---------------- 项目主页（§4.2） ---------------- */
+PAGES.home = async (p) => {
+  const prog = await getProgress(p.id);
+  const cur = prog.steps.find(s => s.key === prog.current);
+  const page = FLOW_PAGE[cur.key];
+  const materials = [p.contract.runtime_fields.length ? "输入字段 " + p.contract.runtime_fields.map(f => f.label).join("、") : "",
+    p.contract.evaluation_fields.length ? "评价字段 " + p.contract.evaluation_fields.map(f => f.label).join("、") : "",
+    p.contract.goal ? "优化目标已填写" : ""].filter(Boolean).join("；") || "暂无材料";
+  return `
+  ${stepBar(prog, p.id)}
+  <div class="card focus">
+    <div class="muted small">现在需要你做的事</div>
+    <h2 style="margin:4px 0">${esc(cur.action)}</h2>
+    <div class="muted small">为什么要做</div>
+    <div>${esc(cur.why)}</div>
+    <div class="muted small" style="margin-top:8px">做完之后</div>
+    <div class="small">${esc(cur.then || "")}</div>
+    <div class="muted small" style="margin-top:8px">已有材料</div>
+    <div class="small">${esc(materials)}</div>
+    <div style="margin-top:12px"><a href="#/proj/${p.id}/${page}"><button>${esc(cur.action)} →</button></a>
+    ${cur.key === "optimize" ? `<a href="#/proj/${p.id}/runs"><button class="grey">查看优化进度</button></a>` : ""}
+    ${cur.key === "verify" && prog.steps[4].done ? `<a href="#/proj/${p.id}/verify"><button class="grey">查看结果报告</button></a>` : ""}</div>
+  </div>
+  <div class="card">
+    <b>辅助入口</b>
+    <div class="flex">
+      <a href="#/proj/${p.id}/materials" class="small">本次材料</a>
+      <a href="#/proj/${p.id}/evaluate" class="small">评价规则与专家意见</a>
+      <a href="#/proj/${p.id}/runs" class="small">历次优化</a>
+      <a href="#/proj/${p.id}/prompts" class="small">提示词版本</a>
+      <a href="#/glossary" class="small">名词解释</a>
+    </div>
+    <p class="muted small">优化目标：${esc(p.contract.goal || "（尚未填写，可在“准备材料”中补充）")}</p>
+  </div>`;
+};
+
+/* ---------------- 第一步：准备材料（§5） ---------------- */
+PAGES.materials = async (p) => {
+  const prog = await getProgress(p.id);
+  const [items, ps] = await Promise.all([
+    api("GET", `/projects/${p.id}/items?size=100`),
+    api("GET", `/projects/${p.id}/prompts`)]);
+  const rt = p.contract.runtime_fields.map(f => esc(f.label)).join("、");
+  const ev = p.contract.evaluation_fields.map(f => esc(f.label)).join("、") || "（无）";
+  return `
+  ${stepBar(prog, p.id)}
+  ${flowIntro("告诉系统“优化什么”：你现在的提示词，以及真实使用时会遇到的案例。",
+    "① 在下方粘贴提示词原文；② 粘贴或导入几条真实案例（有专家指过问题的最好）；③ 用一句话写下你最不满意的地方。",
+    "系统会检查材料、标出每个字段的用途；案例就绪后进入第二步“确认怎么评”。")}
+  <div class="card">
+    <p class="muted">提供你正在使用的提示词，以及一些实际使用案例。已有 AI 输出或专家意见，也可以一起导入。</p>
+    <label>优化目标——一句话说明现在最不满意什么（自由描述，随时可改）</label>
+    <textarea id="mat-goal" style="min-height:60px" placeholder="例：学员列式正确但计算出错时，点评经常说成“概念不清”；希望先区分列式思路与计算，再给结论。">${esc(p.contract.goal || "")}</textarea>
+    <div style="margin-top:6px"><button class="grey" onclick="saveGoal()">保存优化目标</button>
+    <span id="goal-status" class="muted small"></span></div>
+  </div>
+  <div class="card">
+    <b>当前提示词</b>
+    ${ps.prompts.length ? pill(`已有 ${ps.prompts.length} 个版本`, "ok") : pill("尚无提示词", "warn")}
+    ${ps.prompts.length ? `
+      <table><tr><th>名称</th><th>版本</th><th>来源</th><th>长度</th><th></th></tr>
+      ${ps.prompts.slice(0, 5).map(v => `<tr><td>${esc(v.name)}</td><td>v${v.version_no}</td>
+        <td>${pill(v.origin === "optimizer" ? "优化候选" : "人工", v.origin === "optimizer" ? "brand" : "")}</td>
+        <td class="small">${v.length || esc(String(v.body.length))} 字</td>
+        <td><a class="small" href="#/proj/${p.id}/prompts">管理</a></td></tr>`).join("")}</table>`
+      : `<label>粘贴当前提示词正文（提示词里用 {{字段名}} 引用你定义的输入字段，系统会自动替换成每个案例的真实内容）</label>
+         <textarea id="mat-prompt" placeholder="例：&#10;你是一名教研老师。请根据题目与学员答案，给出一份作业点评：先判断对错并说明依据，再指出具体错在哪一步，最后给出可执行的修改建议。"></textarea>
+         <label>提示词名称</label><input id="mat-prompt-name" value="基线提示词">
+         <label>使用的变量（逗号分隔，必须属于输入字段：${esc(p.contract.runtime_fields.map(f => f.name).join("、"))}）</label>
+         <input id="mat-prompt-vars" value="${esc(p.contract.runtime_fields.map(f => f.name).join(","))}">
+         <div class="muted small">这就是${term("基线")}——一切比较的起点；没有现成提示词时可先建初稿，系统会明确标记“无可比较的原始版本”。</div>
+         <div style="margin-top:8px"><button onclick="createBaselinePrompt()">创建初稿版本</button></div>`}
+  </div>
+  <div class="card">
+    <b>实际案例与已有结果</b>
+    <p class="muted small">把真实案例交给系统（相当于${term("开发集")}练习题）。每行一条 JSON：
+    case_id 是案例编号；runtime_input 里放${term("输入字段")}的内容；evaluation_only 里放${term("评价专用字段")}（如参考答案）。
+    不确定格式就照着下面的占位示例抄，或用一条真实案例试跑“预览校验”——系统会逐行告诉你哪里要改。</p>
+    <div class="flex">
+      <div style="flex:0 0 140px"><label>格式</label>
+        <select id="imp-fmt"><option value="jsonl">JSONL</option><option value="csv">CSV（runtime:前缀）</option></select></div>
+      <div style="flex:3"><label>内容（每行一条 JSON，或 CSV 文本）</label>
+        <textarea id="imp-content" placeholder='{"case_id":"c001","runtime_input":{"question":"解方程 2x+3=11","student_answer":"x=4","grade_level":"初中"},"evaluation_only":{"expert_answer":"x=4，正确"}}
+{"case_id":"c002", … 第二条案例 }'></textarea></div>
+    </div>
+    <div style="margin-top:8px">
+      <button onclick="importPreview()">预览校验</button>
+      <button class="ghost" onclick="importCommit()">提交导入</button>
+      <span id="imp-result"></span>
+    </div>
+    <pre id="imp-preview" class="hidden"></pre>
+  </div>
+  <div class="card">
+    <b>字段用途确认（系统建议，可修改）</b>
+    <div class="check"><span class="dot" style="color:var(--ok)">✓</span>
+      <span style="flex:1">交给执行模型：<b>${rt || "（未定义）"}</b></span></div>
+    <div class="check"><span class="dot" style="color:var(--warn)">✓</span>
+      <span style="flex:1">只用于评价（绝不发给执行模型）：<b>${ev}</b></span></div>
+    <div class="check"><span class="dot" style="color:var(--brand)">✓</span>
+      <span style="flex:1">已有案例：<b>${items.total}</b> 条
+      <a class="small" href="#/proj/${p.id}/data">查看与分配集合</a></span></div>
+    <p class="muted small">字段名不能独自决定用途：参考答案等资料能否提供给执行模型，由实际业务确认。</p>
+  </div>
+  <div class="card">
+    <b>锁定案例分组（用于最后的独立检验）</b>
+    <p class="muted small">系统会把案例分成“练习题”（${term("开发集")}）和“考题”（${term("封存测试集")}）并${term("冻结切分")}：
+    考题在优化期间系统碰不到，最后用来检验改好的提示词是不是真有效。点下面按钮即锁定，锁定后本批案例不能换组。</p>
+    <button class="grey" onclick="freezeManifest()">锁定案例分组（冻结切分）</button>
+    <span class="muted small">材料还没齐？没关系，可以先保存草稿继续编辑，之后再来锁定。</span>
+  </div>
+  <div style="margin-top:6px">
+    <a href="#/projects"><button class="grey">保存并返回</button></a>
+    <a href="#/proj/${p.id}/evaluate"><button>下一步：确认怎么评 →</button></a>
+  </div>`;
+};
+async function saveGoal() {
+  await api("PUT", `/projects/${state.pid}/goal`, { goal: document.getElementById("mat-goal").value });
+  document.getElementById("goal-status").textContent = "已保存 ✓";
+  toast("优化目标已保存");
+}
+async function createBaselinePrompt() {
+  try {
+    await api("POST", `/projects/${state.pid}/prompts`, {
+      name: document.getElementById("mat-prompt-name").value.trim() || "基线提示词",
+      body: document.getElementById("mat-prompt").value,
+      variables: document.getElementById("mat-prompt-vars").value.split(",").map(s => s.trim()).filter(Boolean),
+      frozen_segments: [], params: {} });
+    toast("初稿版本已创建（不改变当前使用指针）");
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+async function importPreview() {
+  const fmt = document.getElementById("imp-fmt").value;
+  const content = document.getElementById("imp-content").value;
+  const b = await api("POST", `/projects/${state.pid}/imports/preview`, { fmt, content });
+  window._lastBatch = b;
+  document.getElementById("imp-preview").classList.remove("hidden");
+  document.getElementById("imp-preview").textContent =
+    `批次 ${b.id}\n总行数 ${b.total}，有效 ${b.valid}，错误 ${b.errors.length}\n` +
+    (b.errors.map(e => `第${e.line}行 ${e.case_id || ""}：${(e.reasons || [e.reason]).join("；")}`).join("\n") || "无错误行");
+  document.getElementById("imp-result").innerHTML =
+    b.valid > 0 ? pill(`预览成功：有效 ${b.valid} 条，可提交`, "ok") : pill("无有效行", "bad");
+}
+async function importCommit() {
+  if (!window._lastBatch) { toast("请先预览校验", true); return; }
+  const r = await api("POST",
+    `/projects/${state.pid}/imports/${window._lastBatch.id}/commit`, { exclude_case_ids: [] });
+  toast(`导入完成：本批有效 ${r.valid} 条（重复提交幂等返回同一批次）`);
+  route();
+}
+async function freezeManifest() {
+  try {
+    const r = await api("POST", `/projects/${state.pid}/manifests/freeze`, { seed: 20260927 });
+    toast(`已锁定：练习案例按分组冻结，考题 ${r.sealed_test_items} 条已封存（优化期间系统接触不到）`);
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+
+/* ---------------- 第二步：确认怎么评（§6） ---------------- */
+function fbStatusLabel(s) {
+  return { pending: "待确认", confirmed_error: "已确认错误", preference: "偏好建议",
+    unverified: "待核实", resolved: "已解决", retired: "已停用" }[s] || s;
+}
+PAGES.evaluate = async (p) => {
+  const prog = await getProgress(p.id);
+  const [rs, fbs, tags, rules, items, sugg] = await Promise.all([
+    api("GET", `/projects/${p.id}/rubrics`),
+    api("GET", `/projects/${p.id}/expert_feedback`),
+    api("GET", `/projects/${p.id}/tags`),
+    api("GET", `/projects/${p.id}/rating_rules`),
+    api("GET", `/projects/${p.id}/items?size=100`),
+    api("GET", `/projects/${p.id}/expert_feedback/suggestions`).catch(() => null)]);
+  const pub = rs.rubrics.find(r => r.status === "published");
+  const itemOpts = items.items.map(i => `<option value="${i.id}">${esc(i.case_id)}</option>`).join("");
+  const fbRows = fbs.feedback.map(f => `
+    <tr><td class="small">${esc(f.problem)}${f.quote ? `<div class="muted small">原话：${esc(f.quote)}</div>` : ""}</td>
+    <td class="small">${esc(f.expected || "-")}</td>
+    <td>${pill(f.severity === "severe" ? "严重" : f.severity === "preference" ? "偏好" : "一般",
+        f.severity === "severe" ? "bad" : "")}</td>
+    <td>${pill(fbStatusLabel(f.status), f.status === "confirmed_error" ? "bad" : f.status === "pending" ? "warn" : "")}</td>
+    <td class="small">${esc((f.tags || []).join("、"))}</td>
+    <td class="small">${esc(f.remark || "")}</td>
+    <td>${f.status !== "confirmed_error" ? `<button class="grey" onclick="confirmFeedback('${f.id}')">确认为错误</button>` : ""}</td></tr>`).join("");
+  const tagRows = tags.tags.map(t => `
+    <tr><td>${esc(t.name)}</td><td class="small">${esc(t.definition || "-")}</td>
+    <td>${t.merged_into ? pill("已合并", "warn") : t.active ? pill("启用", "ok") : pill("停用", "")}</td>
+    <td>${t.active && !t.merged_into ? `<button class="grey" onclick="retireTag('${t.id}')">停用</button>` : ""}</td></tr>`).join("");
+  const rule = rules.rules[rules.rules.length - 1];
+  return `
+  ${stepBar(prog, p.id)}
+  ${flowIntro("和系统约定“怎样算改好了”。标准由你确认，系统优化期间不会私自更改。",
+    "① 创建/发布评价标准（系统按你的任务生成草案，改改就能用）；② 把专家指出的问题登记成检查项（保留原话）；③ 看一眼默认的 ABCD 评级规则，可自定义。",
+    "生成一份运行摘要；确认无误后，就可以开始原始测评了。")}
+  <div class="card">
+    <b>为什么要做这一步</b>
+    <p class="muted small">在修改前约定怎样判断改善，避免系统自行改变成功标准。系统根据材料生成可编辑建议，不要求你从零搭建评价体系。</p>
+    评价标准：${pub ? pill(`已发布 v${pub.version_no}`, "ok") + `<a class="small" href="#/proj/${p.id}/rubric"> 查看/编辑</a>`
+      : pill("未发布", "warn") + ` <a class="small" href="#/proj/${p.id}/rubric"> 去创建并发布</a>`}
+  </div>
+  <div class="card">
+    <b>专家意见 → 待确认检查项</b>
+    <p class="muted small">保留专家原话；一条意见拆分为可检查的问题与期望。注意区分：<b>学员得分</b>是 AI 对学员作答的业务评分（待检查的输出），
+    <b>点评质量评价</b>是专家对 AI 点评质量的判断（优化依据）——两者不混用。</p>
+    <div class="flex">
+      <div><label>案例</label><select id="fb-item">${itemOpts}</select></div>
+      <div style="flex:2"><label>问题描述</label><input id="fb-problem" placeholder="如：计算错误被归因为概念不清"></div>
+      <div style="flex:2"><label>专家原话/引用（可选）</label><input id="fb-quote"></div>
+    </div>
+    <div class="flex">
+      <div style="flex:2"><label>期望表现</label><input id="fb-expected" placeholder="如：先区分列式思路与计算错误"></div>
+      <div><label>影响程度</label><select id="fb-sev"><option value="severe">严重</option>
+        <option value="normal" selected>一般</option><option value="preference">偏好建议</option></select></div>
+      <div><label>标签（逗号分隔）</label><input id="fb-tags" placeholder="错误归因,扣分"></div>
+      <div style="flex:2"><label>备注（保留原文）</label><input id="fb-remark"></div>
+    </div>
+    <div style="margin-top:8px"><button onclick="addFeedback()">添加专家意见</button>
+    <details class="small muted" style="margin-top:6px"><summary>批量导入已有专家评价（JSONL）</summary>
+      <textarea id="fb-import" placeholder='{"case_id":"c001","problem":"...","expected":"...","severity":"severe","tags":["..."],"remark":"..."}'></textarea>
+      <button class="grey" onclick="importFeedback()">导入</button></details></div>
+    ${fbs.feedback.length ? `<table><tr><th>问题</th><th>期望</th><th>程度</th><th>状态</th><th>标签</th><th>备注</th><th></th></tr>${fbRows}</table>`
+      : `<p class="muted small">尚无专家意见。可在上方添加，或运行原始测评后由系统按评价标准诊断。</p>`}
+    ${sugg && sugg.aspects && sugg.aspects.length ? `<div class="small" style="margin-top:8px"><b>系统归纳的检查方面</b>：
+      ${sugg.aspects.map(a => `${esc(a.tag)}（${a.count}条${a.severe ? "，含严重" + a.severe + "条" : ""}）`).join("；")}
+      <span class="muted">——需人工确认后作为检查项；标签描述现象，不自动等同于原因。</span></div>` : ""}
+  </div>
+  <div class="card">
+    <b>标签库</b>
+    <div class="flex">
+      <div><label>新标签</label><input id="tag-name" placeholder="名称"></div>
+      <div style="flex:2"><label>定义（描述现象，不定义原因）</label><input id="tag-def"></div>
+      <div style="flex:0"><label> </label><button class="grey" onclick="addTag()">添加</button></div>
+    </div>
+    ${tags.tags.length ? `<table><tr><th>标签</th><th>定义</th><th>状态</th><th></th></tr>${tagRows}</table>` : ""}
+  </div>
+  <div class="card">
+    <b>评级规则（默认 ABCD，可自定义）</b>
+    ${rule ? `${pill(`v${rule.version_no}`, "brand")} ${pill(rule.status === "published" ? "已发布" : "草稿", rule.status === "published" ? "ok" : "warn")}
+      <table><tr><th>等级</th><th>含义</th><th>展示依据</th></tr>
+      ${rule.levels.map(l => `<tr><td><b>${esc(l.code)}</b> ${esc(l.name)}</td><td class="small">${esc(l.meaning)}</td>
+        <td class="small">${esc(l.display_basis)}</td></tr>`).join("")}</table>
+      <p class="muted small">${esc(rule.note || "")} 规则修改产生新版本，历史评价不被重新解释。</p>`
+      : `<p class="muted small">尚未创建评级规则。ABCD 仅为首个支持方案：A=原错误全部避免、B=部分避免、C=没有避免、D=出现更多问题或明显退步；严重新增问题优先判D；始终同时展示原问题改善与新增问题两个维度。</p>
+         <button onclick="createRatingRule()">创建 ABCD 评级规则草案</button>`}
+  </div>
+  <div class="card">
+    <b>试评一个案例（检查评价方式是否合理）</b>
+    <p class="muted small">展示判定和依据，允许专家确认或纠正。单个试评用于理解与调试，不等于自动评价器已经可靠。</p>
+    <div class="flex">
+      <div><label>案例</label><select id="rv-item">${itemOpts}</select></div>
+      <div style="flex:0"><label> </label><button class="grey" onclick="suggestReview()">生成评级建议</button></div>
+    </div>
+    <div id="rv-suggest"></div>
+  </div>
+  <div class="card">
+    <b>运行摘要（开始前确认）</b>
+    <div class="kv">
+      <div>执行/评价模型</div><div>内置离线模拟供应商（演示模式，与真实调用明显区分）；<a class="small" href="#/settings">接入真实模型</a></div>
+      <div>优先目标</div><div>${esc(p.contract.goal || "（建议先在第一步填写优化目标）")}</div>
+      <div>不能退步的要求</div><div>原有正确案例不得回退；严重错误不得增加（服务端强制检查）</div>
+      <div>运行上限</div><div>轮数与token预算在启动时设定；预算耗尽自动暂停，验收预留单独保护</div>
+      <div>需要人工介入的情况</div><div>人工参与模式下每轮等待指定评价；自动模式对关键分歧请求人工处理</div>
+    </div>
+    <div style="margin-top:10px">
+      <a href="#/proj/${p.id}/materials"><button class="grey">返回材料</button></a>
+      <a href="#/proj/${p.id}/baseline"><button>开始原始测评 →</button></a>
+    </div>
+  </div>`;
+};
+async function addFeedback() {
+  const item = document.getElementById("fb-item").value;
+  try {
+    await api("POST", `/projects/${state.pid}/expert_feedback`, {
+      item_id: item, problem: document.getElementById("fb-problem").value,
+      quote: document.getElementById("fb-quote").value,
+      expected: document.getElementById("fb-expected").value,
+      severity: document.getElementById("fb-sev").value,
+      tags: document.getElementById("fb-tags").value.split(/[，,]/).map(s => s.trim()).filter(Boolean),
+      remark: document.getElementById("fb-remark").value, status: "confirmed_error" });
+    toast("专家意见已登记（原话与备注保留原文）");
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+async function confirmFeedback(fid) {
+  await api("PUT", `/expert_feedback/${fid}`, { status: "confirmed_error" });
+  toast("已确认；该问题将进入优化目标"); route();
+}
+async function importFeedback() {
+  try {
+    const r = await api("POST", `/projects/${state.pid}/expert_feedback/import`,
+      { content: document.getElementById("fb-import").value });
+    toast(`导入 ${r.created} 条；${r.errors.length ? "错误 " + r.errors.length + " 条（逐行显示，不静默丢弃）" : "无错误"}`);
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+async function addTag() {
+  try { await api("POST", `/projects/${state.pid}/tags`,
+    { name: document.getElementById("tag-name").value, definition: document.getElementById("tag-def").value });
+    route(); } catch (e) { toast(errText(e), true); }
+}
+async function retireTag(tid) { await api("POST", `/tags/${tid}/retire`); route(); }
+async function createRatingRule() {
+  const r = await api("POST", `/projects/${state.pid}/rating_rules`);
+  toast("ABCD 评级规则草案已创建：" + r.id);
+  route();
+}
+async function suggestReview() {
+  const rules = await api("GET", `/projects/${state.pid}/rating_rules`);
+  const rule = rules.rules[rules.rules.length - 1];
+  if (!rule) { toast("请先创建评级规则", true); return; }
+  const item = document.getElementById("rv-item").value;
+  const s = await api("POST", `/projects/${state.pid}/case_reviews/suggest`,
+    { item_id: item, rule_id: rule.id });
+  const box = document.getElementById("rv-suggest");
+  box.innerHTML = `
+    <div class="check" style="margin-top:8px"><span class="dot">●</span>
+      <span style="flex:1">建议评级 <b>${esc(s.rating)}</b> —— ${esc(s.basis)}
+      <div class="muted small">${esc(s.note)}</div></span></div>
+    ${s.resolutions.map(r => `<div class="small muted">问题「${esc(r.problem)}」→ ${esc(r.status)}</div>`).join("")}
+    <div style="margin-top:6px"><button onclick="confirmReview('${item}','${rule.id}','${s.rating}')">确认该评级（人工确认）</button></div>`;
+}
+async function confirmReview(item, rule, rating) {
+  try {
+    await api("POST", `/projects/${state.pid}/case_reviews`,
+      { item_id: item, rule_id: rule, rating, source: "human_confirmed" });
+    toast("点评质量评价已记录（来源：人工确认）");
+  } catch (e) { toast(errText(e), true); }
+}
+
+/* ---------------- 第三步：原始测评（§7） ---------------- */
+function isBaselineRun(r) {
+  const o = (r.snapshot && r.snapshot.optimization) || {};
+  return !parseInt(o.max_rounds || o.max_candidates || 0);
+}
+PAGES.baseline = async (p) => {
+  const prog = await getProgress(p.id);
+  const runs = await api("GET", `/projects/${p.id}/runs`);
+  const baselineRuns = runs.runs.filter(r => isBaselineRun(r));
+  const latest = baselineRuns.find(r => r.state === "completed");
+  let problemsHtml = "";
+  if (latest) {
+    const probs = [];
+    for (const [iid, per] of Object.entries(latest.baseline_problems || {})) {
+      for (const fbk of (per.items || [])) probs.push({ iid, ...fbk });
+    }
+    problemsHtml = probs.length ? `
+      <table><tr><th>案例</th><th>核查的问题</th><th>自动核查</th></tr>
+      ${probs.map(x => `<tr><td class="small">${esc(x.iid.slice(0, 12))}…</td>
+        <td class="small">${esc(x.feedback_id)}</td><td>${pill(x.status === "resolved" ? "已解决" :
+        x.status === "partial" ? "部分存在" : x.status === "unresolved" ? "仍存在" : "无法判断", "warn")}</td></tr>`).join("")}</table>
+      <p class="muted small">先展示主要问题；每条问题的证据可在运行事件流与输出详情中追溯。</p>`
+      : `<p class="muted small">原始测评已完成。该项目尚未登记专家问题，系统按评价标准维度诊断；可回到“确认怎么评”补充专家意见。</p>`;
+  }
+  return `
+  ${stepBar(prog, p.id)}
+  ${flowIntro("先测现状：用你确认的标准，把现在的提示词完整测一遍，看清它差在哪。",
+    "选好基线提示词和评价标准（都会自动带出），点“运行原始测评”。内置演示供应商几秒出结果。",
+    "得到一份问题清单和每条问题的证据；确认这些问题确实是你想解决的，再开始自动优化。")}
+  <div class="card">
+    <b>为什么做原始测评</b>
+    <p class="muted small">建立优化起点，确认系统发现的问题确实是你要解决的问题。导入的历史输出只有来源与配置满足比较要求时才能用于正式前后对照；否则用于诊断，必要时重新生成可比输出。</p>
+    <div class="flex">
+      <div><label>基线提示词版本</label><select id="bl-prompt"></select></div>
+      <div><label>评价标准（已发布）</label><select id="bl-rubric"></select></div>
+      <div style="flex:0"><label> </label><button onclick="startBaselineRun()">运行原始测评</button></div>
+    </div>
+  </div>
+  <div class="card">
+    <b>测评结果与问题清单</b>
+    ${latest ? `<div class="kv">
+      <div>原始平均分</div><div>${(latest.baseline_score || 0).toFixed(3)}</div>
+      <div>运行</div><div class="small"><a href="#/proj/${p.id}/run/${latest.id}">${esc(latest.id)}</a>
+      （可独立访问，刷新后仍是对应运行）</div></div>${problemsHtml}`
+      : `<p class="muted small">尚未运行原始测评。点击上方“运行原始测评”：系统按已确认的评价方案测评原始提示词。</p>`}
+  </div>
+  <div class="card">
+    <b>下一步</b>
+    <p class="muted small">确认问题清单后，按这些问题开始自动优化；后续规则稳定的运行，可预先选择原始测评后自动继续。</p>
+    <a href="#/proj/${p.id}/optimize"><button ${latest ? "" : "disabled"}>按这些问题开始自动优化 →</button></a>
+  </div>`;
+};
+async function startBaselineRun() {
+  try {
+    await startRunCommon({ max_rounds: 0, dev_sample_size: 8, min_delta: 0.02 });
+    toast("原始测评已启动（离开页面不影响运行）");
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+
+/* ---------------- 运行启动公共逻辑 ---------------- */
+async function startRunCommon(opt) {
+  const [ps, rs, mans] = await Promise.all([
+    api("GET", `/projects/${state.pid}/prompts`),
+    api("GET", `/projects/${state.pid}/rubrics`),
+    api("GET", `/projects/${state.pid}/manifests`)]);
+  const pvEl = document.getElementById("bl-prompt") || document.getElementById("ex-pv");
+  const rubEl = document.getElementById("bl-rubric") || document.getElementById("ex-rubric");
+  const baseline = (pvEl && pvEl.value) || (ps.prompts[ps.prompts.length - 1] || {}).id;
+  const rubric = (rubEl && rubEl.value) ||
+    ((rs.rubrics.filter(r => r.status === "published").slice(-1)[0]) || {}).id;
+  if (!baseline || !rubric) { throw new Error("需要先准备提示词并发布评价标准（第二步）"); }
+  let devIds = window._devIds;
+  if (!devIds || !devIds.length) {
+    devIds = (await api("GET", `/projects/${state.pid}/items?split=dev&size=100`)).items.map(i => i.id);
+  }
+  if (!devIds.length) { throw new Error("需要先导入案例并分配到开发集（dev）"); }
+  const draft = {
+    mode: "explore", prompt: { baseline_id: baseline }, rubric_id: rubric, judge_id: null,
+    manifest_id: (mans.manifests[0] || {}).id || "",
+    data: { dev_item_ids: devIds, select_item_ids: [] },
+    models: { generation: { connection_id: "conn_mock" }, evaluation: { connection_id: "conn_mock" },
+              optimizer: { connection_id: "conn_mock" } },
+    optimization: opt,
+    budget: { mode: "token", total_limit: 2_000_000, search_limit: 1_200_000, acceptance_limit: 600_000 },
+  };
+  const r = await api("POST", `/projects/${state.pid}/runs`, draft,
+    { "Idempotency-Key": "ui-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) });
+  return r;
+}
+
+/* ---------------- 第四步：自动优化（§8） ---------------- */
+PAGES.optimize = async (p) => {
+  const prog = await getProgress(p.id);
+  const [ps, rs] = await Promise.all([
+    api("GET", `/projects/${p.id}/prompts`),
+    api("GET", `/projects/${p.id}/rubrics`)]);
+  const pubRub = rs.rubrics.filter(r => r.status === "published");
+  const pvOpts = ps.prompts.map(v => `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(v.origin)}）</option>`).join("");
+  const rubOpts = pubRub.map(r => `<option value="${r.id}">v${r.version_no}（已发布）</option>`).join("");
+  return `
+  ${stepBar(prog, p.id)}
+  ${flowIntro(`系统自动“改一点 → 测一遍”反复尝试，只保留真的变好的版本（${term("候选")}）。`,
+    "设置轮数上限等参数——默认值就能开始；可选“人工参与”模式（每轮停下等你确认）。",
+    "每一轮都有记录：为什么改、改了什么、效果如何、为什么保留或淘汰；结束后锁定一个待验证版本。")}
+  <div class="card">
+    <b>启动自动优化</b>
+    <p class="muted small">系统按“查看失败案例 → 提出修改假设 → 修改提示词 → 重新测评 → 比较并保留版本”循环执行；
+    默认在已确认的方案和上限内连续执行。停止条件：达到目标、连续无值得保留的改善、达到轮数上限、主动停止或无法继续的错误。</p>
+    <div class="grid2">
+      <div><label>基线提示词版本</label><select id="ex-pv">${pvOpts}</select></div>
+      <div><label>评价标准（已发布）</label><select id="ex-rubric">${rubOpts}</select></div>
+      <div><label>优化轮数上限</label><input id="op-rounds" type="number" value="3"></div>
+      <div><label>连续无改善停止（轮）</label><input id="op-stall" type="number" value="2"></div>
+      <div><label>最小改善阈值</label><input id="op-delta" type="number" step="0.01" value="0.05"></div>
+      <div><label>提示词长度上限（字）</label><input id="op-len" type="number" value="4000"></div>
+      <div><label>开发集抽样</label><input id="op-sample" type="number" value="8"></div>
+      <div><label>人工参与模式</label><select id="op-human"><option value="">自动连续执行</option>
+        <option value="1">每轮等待人工评价</option></select></div>
+    </div>
+    <div style="margin-top:10px"><button onclick="startOptimizeRun()">启动自动优化</button>
+    <span class="muted small">预算：token 总额 200 万（搜索 120 万 + 独立验收预留 60 万，验收预留单独保护 TC033）。
+    高级预算与批量模式见 <a class="small" href="#/proj/${p.id}/experiment">实验配置</a>。</span></div>
+  </div>
+  ${await renderRunList(p)}`;
+};
+async function startOptimizeRun() {
+  try {
+    const r = await startRunCommon({
+      max_rounds: +document.getElementById("op-rounds").value || 3,
+      stall_rounds: +document.getElementById("op-stall").value || 2,
+      min_delta: +document.getElementById("op-delta").value || 0.05,
+      length_limit_chars: +document.getElementById("op-len").value || 4000,
+      dev_sample_size: +document.getElementById("op-sample").value || 8,
+      human_in_loop: !!document.getElementById("op-human").value,
+    });
+    toast("自动优化已启动：" + r.id);
+    location.hash = `#/proj/${state.pid}/run/${r.id}`;
+  } catch (e) { toast(errText(e), true); }
+}
+function runStateLabel(s) {
+  return { queued: "排队", running: "运行中", waiting_human: "等待人工参与", paused_budget: "预算暂停",
+    stopping: "停止中", completed: "已完成", failed: "失败", cancelled: "已取消" }[s] || s;
+}
+function runStopLabel(s) {
+  return { candidate_found: "发现保留候选", no_improvement: "无提升（保留基线）", stalled_no_gain: "连续无改善",
+    rewrite_stalled: "改写连续失败", target_reached: "达到目标", budget_exhausted: "预算耗尽",
+    user_cancelled: "主动停止" }[s] || (s || "-");
+}
+async function renderRunList(p) {
+  const runs = await api("GET", `/projects/${p.id}/runs`);
+  const rows = runs.runs.map(r => {
+    const kind = isBaselineRun(r) ? pill("原始测评", "brand") : pill("自动优化", "");
+    const kept = (r.candidates || []).filter(c => c.decision === "kept").length;
+    return `<tr><td class="small"><a href="#/proj/${p.id}/run/${r.id}">${esc(r.id)}</a></td>
+    <td>${kind}</td><td>${pill(runStateLabel(r.state), r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}</td>
+    <td class="small">${esc(runStopLabel(r.stop_reason))}</td>
+    <td class="small">${kept} 保留 / ${(r.candidates || []).length} 候选</td>
+    <td class="small">${esc(r.created_at)}</td></tr>`;
+  }).join("");
+  return `<div class="card"><b>历次优化</b>
+    <p class="muted small">离开页面不取消运行；每次运行有独立地址，刷新后仍是对应运行（§12）。</p>
+    ${runs.runs.length
+      ? `<table><tr><th>运行</th><th>类型</th><th>状态</th><th>停止原因</th><th>候选</th><th>时间</th></tr>${rows}</table>`
+      : `<div class="empty">还没有运行过。<br>
+         建议顺序：先去<a href="#/proj/${p.id}/baseline">原始测评</a>看看现状差在哪，再回来启动自动优化。<br>
+         <a href="#/proj/${p.id}/baseline"><button class="grey" style="margin-top:8px">去做原始测评</button></a></div>`}</div>`;
+}
+PAGES.runs = async (p) => renderRunList(p);
+
+/* ---------------- 运行详情（独立可恢复路由 §8.4/§12） ---------------- */
+let _pollTimer = null;
+async function pageRunDetail(rid) {
+  clearInterval(_pollTimer);
+  const [r] = await Promise.all([api("GET", `/runs/${rid}`)]);
+  const kept = (r.candidates || []).filter(c => c.decision === "kept");
+  const canLock = r.state === "completed" && !r.locked_candidate;
+  const candRows = (r.candidates || []).map(c => `
+    <tr><td class="small">${esc(c.candidate_id)}</td>
+    <td>${pill(c.decision === "kept" ? "保留" : c.decision === "retained_alt" ? "备选" : "淘汰",
+        c.decision === "kept" ? "ok" : c.decision === "retained_alt" ? "brand" : "")}</td>
+    <td>${c.score != null ? c.score.toFixed(3) : ""}</td>
+    <td>${c.usable_rate != null ? (c.usable_rate * 100).toFixed(0) + "%" : ""}</td>
+    <td class="small">${c.regressions || 0} 回退 / ${c.severe || 0} 严重 / ${c.fixed_problems ? c.fixed_problems.length : 0} 修复</td>
+    <td class="small">${c.length || ""} 字</td>
+    <td class="small" style="white-space:normal">${esc(c.rationale || "")}</td>
+    <td>${canLock && (c.decision === "kept" || c.decision === "retained_alt")
+      ? `<button onclick="lockCand('${r.id}','${c.candidate_id}')">锁定为待验证</button>` : ""}</td></tr>`).join("");
+  const roundCards = (r.rounds || []).map(rd => `
+    <div class="card round">
+      <div class="flex" style="align-items:baseline">
+        <div style="flex:1"><b>第 ${rd.round_no} 轮</b>
+          ${pill(rd.status === "scored" ? "已测评" : rd.status === "rewrite_failed" ? "改写失败" : "无修改",
+            rd.status === "scored" ? "ok" : "warn")}</div>
+        <div class="small muted">${esc(rd.created_at)}</div>
+      </div>
+      ${rd.hypothesis ? `<div class="small"><b>修改假设：</b>${esc(rd.hypothesis)}</div>` : ""}
+      ${rd.rationale ? `<div class="small ${rd.status === "rewrite_failed" ? "" : "muted"}"><b>保留决定：</b>${esc(rd.rationale)}</div>` : ""}
+      ${rd.status === "scored" ? `<div class="small muted">平均分 ${rd.prev_score != null ? Number(rd.prev_score).toFixed(3) : "-"} → ${rd.score != null ? Number(rd.score).toFixed(3) : "-"}；
+        可用率 ${(Number(rd.usable_rate) * 100 || 0).toFixed(0)}%；长度 ${rd.length_chars} 字</div>` : ""}
+      ${rd.next_direction ? `<div class="small muted">下一轮方向：${esc(rd.next_direction)}</div>` : ""}
+    </div>`).join("");
+  setMain(`
+  <div class="flex" style="align-items:baseline"><div style="flex:1">
+    <h1>运行 ${esc(r.id)}</h1>
+    <p class="sub">${pill(runStateLabel(r.state), r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}
+    停止原因：${esc(runStopLabel(r.stop_reason))} ·
+    ${isBaselineRun(r) ? "原始测评" : "自动优化"} · 阶段 ${esc(r.stage || "-")}</p></div>
+    <div style="flex:0"><a class="small" href="#/proj/${state.pid}/optimize">← 返回运行列表</a></div></div>
+  ${r.state === "running" ? `<div class="card"><p class="muted small">正在优化：第 ${r.round_no + 1} 轮。
+    正在检查：原问题是否减少；其他判断是否退步；评分是否仍符合标准。未完成全部轮数前不显示完成百分比。</p></div>` : ""}
+  ${r.state === "waiting_human" ? `<div class="card focus"><b>等待人工参与</b>
+    <p class="muted small">本轮已完成，等待指定评价。离开页面不影响运行；确认评价后点击继续。</p>
+    <button onclick="continueRun('${r.id}')">继续优化 →</button></div>` : ""}
+  ${r.state === "paused_budget" ? `<div class="card"><b>预算暂停</b>
+    <p class="muted small">搜索预算耗尽；独立验收预留未被占用（TC033）。已完成输出全部保留。</p>
+    <button onclick="resumeRun('${r.id}')">恢复运行</button></div>` : ""}
+  <div class="card">
+    <b>基线与候选对比（不只比较平均分）</b>
+    <div class="kv"><div>基线平均分</div><div>${r.baseline_score != null ? Number(r.baseline_score).toFixed(3) : "-"}</div>
+    <div>待验证版本</div><div class="small">${r.locked_candidate ? esc(r.locked_candidate) + "（已锁定，可去「验证与使用」做最终检验）" : canLock ? "未锁定：在下方选择保留一个候选，或保留原版" : "未锁定"}</div>
+    <div>账本用量</div><div class="small">已用 ${esc(JSON.stringify(r.budget.spent || {}))} / 在途 ${esc(JSON.stringify(r.budget.reserved || {}))}</div></div>
+    ${(r.candidates || []).length ? `<table style="margin-top:8px"><tr><th>候选</th><th>决定</th><th>平均分</th><th>可用率</th><th>底线检查</th><th>长度</th><th>依据</th><th></th></tr>${candRows}</table>`
+      : `<p class="muted small">尚无候选${r.state === "completed" ? "：本轮没有产生值得保留的修改，保留基线为合法结果（TC037）" : ""}。</p>`}
+    <div style="margin-top:8px">
+      ${canLock ? `<button class="grey" onclick="lockCand('${r.id}','baseline')">不采用候选，保留原版</button>` : ""}
+      ${r.locked_candidate && r.locked_candidate !== "baseline" ? `<a href="#/proj/${state.pid}/verify"><button>去验证与使用 →</button></a>` : ""}
+      ${r.locked_candidate === "baseline" ? `<span class="muted small">已保留原版。如需对新版本做验证，可在“验证与使用”页选择。</span>` : ""}
+      ${r.state !== "completed" && r.state !== "cancelled" && r.state !== "failed" ?
+        `<button class="danger" onclick="cancelRun('${r.id}',${r.revision})">停止优化（保留已完成结果）</button>` : ""}
+      <details class="small"><summary>事件流与日志（默认折叠）</summary><pre id="ev-out" class="small">加载中…</pre></details>
+    </div>
+  </div>
+  ${roundCards || ""}`);
+  pollEvents(rid, 0);
+  if (r.state === "running") _pollTimer = setInterval(() => pollEvents(rid, window._evCursor || 0), 2500);
+}
+async function pollEvents(rid, cursor) {
+  try {
+    const r = await api("GET", `/runs/${rid}/events?cursor=${cursor}`);
+    window._evCursor = r.events.length ? r.events[r.events.length - 1].seq : cursor;
+    const el = document.getElementById("ev-out");
+    if (el && r.events.length) {
+      if (el.textContent.startsWith("加载中")) el.textContent = "";
+      el.textContent += r.events.map(e => `[${e.seq}] ${e.type} ${JSON.stringify(e.payload)}`).join("\n") + "\n";
+    }
+  } catch (e) { /* 轮询失败静默重试 */ }
+}
+async function continueRun(rid) {
+  await api("POST", `/runs/${rid}/continue`); toast("已继续优化");
+  pageRunDetail(rid);
+}
+async function resumeRun(rid) { await api("POST", `/runs/${rid}/resume`); pageRunDetail(rid); }
+async function lockCand(rid, cid) {
+  try {
+    await api("POST", `/runs/${rid}/lock`, { candidate_id: cid });
+    toast(cid === "baseline" ? "已保留原版。" : "已锁定待验证版本——最后一步：用“考题”做独立验证。");
+    pageRunDetail(rid);
+  } catch (e) { toast(errText(e), true); }
+}
+async function cancelRun(rid, revision) {
+  try { await api("POST", `/runs/${rid}/cancel`, { revision });
+    toast("已请求停止：停止派发新请求，在途结果仍入账；已完成输出保留"); pageRunDetail(rid); }
+  catch (e) { toast(errText(e), true); }
+}
+
+/* ---------------- 第五步：验证与使用（§9） ---------------- */
+function decisionPill(d) {
+  const map = { verified_improvement: ["验证有效", "ok"], no_improvement: ["未见提升", "warn"],
+    regression: ["存在退步", "bad"], inconclusive: ["证据不足（尚未证实）", "warn"],
+    evaluation_invalid: ["评价无效", "bad"] };
+  const [label, cls] = map[d] || [d, ""];
+  return pill(label, cls);
+}
+PAGES.verify = async (p) => {
+  const prog = await getProgress(p.id);
+  const [runs, reps] = await Promise.all([
+    api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/reports`)]);
+  const done = runs.runs.filter(r => r.state === "completed" && r.locked_candidate);
+  const runOpts = done.map(r => `<option value="${r.id}">${esc(r.id)}（锁定：${esc(r.locked_candidate)}）</option>`).join("");
+  const repRows = reps.reports.map(r => `
+    <tr><td class="small">${esc(r.id)}</td><td>${decisionPill(r.decision)}</td>
+    <td>${(r.stats.diff * 100).toFixed(1)}pp</td>
+    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td>
+    <td class="small">${esc(r.created_at)}</td></tr>`).join("");
+  return `
+  ${stepBar(prog, p.id)}
+  ${flowIntro("最终检验：用优化期间系统碰不到的“考题”（" + "封存测试集）测试，防止只是背会了练习题。",
+    "先在运行详情里锁定一个待验证版本（或选择保留原版），然后回到这里点“发起独立验证”。",
+    "得到明确结论：验证有效 / 未见提升 / 存在退步 / 证据不足——以及完整的效果报告和新提示词。")}
+  <div class="card">
+    <b>为什么要独立验证</b>
+    <p class="muted small">检查修改是否不仅修好了已经看过的案例，还适用于未参与优化的新情况。
+    固定候选、评价规则和模型配置后，对原始版与候选版进行可比测试。
+    ${reps.reports.length ? "" : pill("尚未独立验证", "warn")}</p>
+    <div class="flex">
+      <div><label>已完成并锁定候选的运行</label><select id="acc-run">${runOpts}</select></div>
+      <div style="flex:0"><label> </label><button onclick="acceptRun()">发起独立验证（解封测试集）</button></div>
+    </div>
+    <p class="muted small">解封一次性消耗封存测试集（TC043）；结论只有五类：verified_improvement / no_improvement / regression / inconclusive / evaluation_invalid。</p>
+    ${done.length ? "" : `<p class="small muted" style="margin-top:4px">还没有可验证的运行：先在「自动优化」里完成一次运行，并在运行详情中锁定待验证版本（或保留原版）。</p>`}
+  </div>
+  <div class="card">
+    <b>验证报告</b>
+    ${reps.reports.length ? `<table><tr><th>报告</th><th>结论</th><th>配对差异</th><th>规模</th><th>时间</th></tr>${repRows}</table>`
+      : `<p class="muted small">尚无报告。注意：优化样例上的改善不构成独立证明。</p>`}
+  </div>
+  ${reps.reports.length ? await renderReportDetail(reps.reports[0].id) : ""}
+  <div class="card">
+    <b>使用与继续优化</b>
+    <p class="muted small">复制文本不等于验证通过；正式采用必须绑定 verified 报告（TC048）。
+    没有独立样例时明确标记“尚未独立验证”。最终验证反馈一旦用于继续改写，该批材料不再作为下一轮的独立证明。</p>
+    <a href="#/proj/${p.id}/usage"><button class="grey">发布/回滚/反馈（高级）</button></a>
+  </div>`;
+};
+async function renderReportDetail(repId) {
+  const r = await api("GET", `/reports/${repId}`);
+  const s = r.stats;
+  const psStats = s.problem_stats || {};
+  const es = s.evidence_scope || {};
+  let promptBlock = "";
+  try {
+    const cand = await api("GET", `/prompts/${r.candidate_ref}`);
+    const base = await api("GET", `/prompts/${r.baseline_ref}`);
+    promptBlock = `
+    <div class="grid2">
+      <div><b>原始版（v${base.version_no}，${base.length} 字）</b><div class="out-text small">${esc(base.body)}</div></div>
+      <div><b>候选版（v${cand.version_no}，${cand.length} 字）</b><div class="out-text small">${esc(cand.body)}</div></div>
+    </div>
+    <button class="grey" onclick="copyPrompt('${r.candidate_ref}')">复制候选提示词</button>
+    <button class="grey" onclick="exportReport('${r.id}')">导出报告（JSON）</button>
+    <span class="muted small">复制文本不等于验证通过（§9.4）</span>`;
+  } catch (e) { promptBlock = `<p class="muted small">（提示词明细不可用）</p>`; }
+  const abcd = psStats.abcd || {};
+  return `
+  <div class="card">
+    <b>结果报告 ${esc(r.id)}</b> ${decisionPill(r.decision)}
+    <h2>1. 结论</h2>
+    <div>${decisionPill(r.decision)} 主指标：${esc(s.primary_metric || "-")}；
+    基线可用率 ${(s.baseline_usable_rate * 100).toFixed(1)}% → 候选 ${(s.candidate_usable_rate * 100).toFixed(1)}%，
+    差异 ${(s.diff * 100).toFixed(1)}pp</div>
+    <h2>2. 专家原问题的解决情况</h2>
+    <div class="small">${psStats.total_registered ? `
+      问题项 n=${psStats.total_registered}（案例 ${psStats.rated_cases} 个）：
+      完全解决 ${psStats.resolution.resolved}、部分解决 ${psStats.resolution.partial}、
+      未解决 ${psStats.resolution.unresolved}、无法判断 ${psStats.resolution.unknown}${psStats.resolution.already_ok ? `、基线已正常 ${psStats.resolution.already_ok}` : ""}
+      <div class="muted">问题项数量与案例数量分开统计，不混用（§9.3）。</div>` : esc(psStats.note || "无登记问题")}</div>
+    <h2>3. 新增问题与原有能力退步</h2>
+    <div class="small">严重错误：基线 ${s.severe_baseline} → 候选 ${s.severe_candidate}
+      ${s.severe_upper_bound_95 != null ? `；候选零严重错误观察的单侧95%上界 ${(s.severe_upper_bound_95 * 100).toFixed(2)}%（不等于真实零风险）` : ""}<br>
+      ABCD 分布：A ${abcd.A ?? 0} / B ${abcd.B ?? 0} / C ${abcd.C ?? 0} / D ${abcd.D ?? 0} /
+      无法判断 ${abcd.cannot_judge ?? 0} / 未登记 ${abcd.not_rated ?? 0}
+      <div class="muted">${esc(psStats.note || "")}</div></div>
+    <h2>4. 独立验证结果</h2>
+    <div class="small">修复 ${s.fix} / 退步 ${s.regress} / 双可用 ${s.both} / 双不可用 ${s.neither}；来源 n=${s.group_n}；
+      精确McNemar双侧 p=${s.mcnemar_p != null ? Number(s.mcnemar_p).toFixed(6) : "-"}；
+      bootstrap 95%CI=[${(s.bootstrap.ci_low * 100).toFixed(1)}pp, ${(s.bootstrap.ci_high * 100).toFixed(1)}pp]；
+      缺失界限 ${(s.missing_bounds.low * 100).toFixed(1)}%–${(s.missing_bounds.high * 100).toFixed(1)}%（未知 ${s.missing_bounds.unknown_n} 条不删除）</div>
+    <h2>5. 证据范围与统计口径</h2>
+    <div class="small">${esc(es.optimization_sample?.role || "")}（n=${es.optimization_sample?.n ?? "-"}）；
+      ${esc(es.independent?.role || "")}（n=${es.independent?.n ?? "-"}，已消耗）
+      <div class="muted">${esc(es.note || "")}</div></div>
+    <h2>6. 完整提示词与使用</h2>
+    ${promptBlock}
+  </div>`;
+}
+async function copyPrompt(pvid) {
+  const pv = await api("GET", `/prompts/${pvid}`);
+  try { await navigator.clipboard.writeText(pv.body); toast("提示词已复制到剪贴板"); }
+  catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = pv.body; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); document.body.removeChild(ta);
+    toast("提示词已复制");
+  }
+}
+function exportReport(repId) {
+  api("GET", `/reports/${repId}`).then(r => {
+    const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `验证报告_${repId}.json`;
+    a.click(); URL.revokeObjectURL(a.href);
+    toast("报告已导出");
+  });
+}
+async function acceptRun() {
+  const rid = document.getElementById("acc-run").value;
+  if (!rid) { toast("暂无可验收的运行：先完成优化并锁定候选", true); return; }
+  try {
+    const r = await api("POST", `/runs/${rid}/accept`);
+    toast("独立验证完成：" + r.decision);
+    route();
+  } catch (e) { toast(errText(e), true); }
+}
+
+/* ---------------- 高级功能：案例与数据 ---------------- */
 PAGES.data = async (p) => {
   const items = await api("GET", `/projects/${p.id}/items?size=100`);
   const mans = await api("GET", `/projects/${p.id}/manifests`);
@@ -167,13 +1126,12 @@ PAGES.data = async (p) => {
   return `
   <div class="card">
     <b>导入案例（JSONL / CSV）</b>
-    <p class="muted small">预览校验逐行报错，不静默丢行；提交携带预览哈希，重复提交幂等（TC006/TC007）。
-    evaluation_only 字段仅用于评价，绝不进入生成请求（BR01）。</p>
+    <p class="muted small">预览校验逐行报错，不静默丢行；提交携带预览哈希，重复提交幂等（TC006/TC007）。</p>
     <div class="flex">
       <div style="flex:0 0 140px"><label>格式</label>
         <select id="imp-fmt"><option value="jsonl">JSONL</option><option value="csv">CSV（runtime:前缀）</option></select></div>
-      <div style="flex:3"><label>内容（每行一条 JSON，或 CSV 文本）</label>
-        <textarea id="imp-content" placeholder='{"case_id":"c001","source_group_id":"g001","runtime_input":{...},"evaluation_only":{...}}'></textarea></div>
+      <div style="flex:3"><label>内容</label>
+        <textarea id="imp-content" placeholder='{"case_id":"c001","runtime_input":{...},"evaluation_only":{...}}'></textarea></div>
     </div>
     <div style="margin-top:8px">
       <button onclick="importPreview()">预览校验</button>
@@ -188,8 +1146,6 @@ PAGES.data = async (p) => {
   </div>
   <div class="card">
     <b>分组切分冻结</b>
-    <p class="muted small">同源分组跨开发/选择/封存将被阻止（TC008）；封存原文进入受限存储，
-    普通列表与选择器无法读取（TC010）。冻结产生不可变数据版本（TC011）。</p>
     <button onclick="freezeManifest()">冻结切分清单</button>
     <div class="small muted">已有清单：${mans.manifests.map(m =>
       `${esc(m.id)}（种子${m.seed}，${esc(m.state)}）`).join("；") || "暂无"}</div>
@@ -197,38 +1153,12 @@ PAGES.data = async (p) => {
       `v${v.version_no} ${esc(v.id.slice(0, 12))}`).join("，") || "暂无"}</div>
   </div>`;
 };
-async function importPreview() {
-  const fmt = document.getElementById("imp-fmt").value;
-  const content = document.getElementById("imp-content").value;
-  const b = await api("POST", `/projects/${state.pid}/imports/preview`, { fmt, content });
-  window._lastBatch = b;
-  document.getElementById("imp-preview").classList.remove("hidden");
-  document.getElementById("imp-preview").textContent =
-    `批次 ${b.id}\n总行数 ${b.total}，有效 ${b.valid}，错误 ${b.errors.length}\n` +
-    (b.errors.map(e => `第${e.line}行 ${e.case_id || ""}：${(e.reasons || [e.reason]).join("；")}`).join("\n") || "无错误行");
-  document.getElementById("imp-result").textContent =
-    b.valid > 0 ? pill(`预览成功：有效 ${b.valid} 条，可提交`, "ok") : pill("无有效行", "bad");
-}
-async function importCommit() {
-  if (!window._lastBatch) { toast("请先预览校验", true); return; }
-  const r = await api("POST",
-    `/projects/${state.pid}/imports/${window._lastBatch.id}/commit`, { exclude_case_ids: [] });
-  toast(`导入完成：本批有效 ${r.valid} 条（重复提交幂等返回同一批次）`);
-  route();
-}
 async function setSplit(itemId, split) {
   await api("POST", `/projects/${state.pid}/split`, { case_ids: [itemId], split });
   route();
 }
-async function freezeManifest() {
-  try {
-    const r = await api("POST", `/projects/${state.pid}/manifests/freeze`, { seed: 20260927 });
-    toast(`已冻结：分组 ${r.groups} 个，封存测试 ${r.sealed_test_items} 条`);
-    route();
-  } catch (e) { toast(e.message, true); }
-}
 
-/* ---------------- P04 评价标准 ---------------- */
+/* ---------------- 高级功能：评价标准 ---------------- */
 PAGES.rubric = async (p) => {
   const rs = await api("GET", `/projects/${p.id}/rubrics`);
   const rows = rs.rubrics.map(r => `
@@ -236,16 +1166,15 @@ PAGES.rubric = async (p) => {
     <td class="small">${r.schema.dimensions.map(d => esc(d.name)).join("、")}</td>
     <td class="small">${esc(r.hash.slice(0, 12))}</td>
     <td>${r.status === "draft" ? `<button onclick="publishRubric('${r.id}')">发布</button>` : ""}
-    <button class="grey" onclick='editRubric(${JSON.stringify(JSON.stringify(r.schema))})'>编辑草稿</button></td></tr>`).join("");
+    <button class="grey" onclick='editRubric(${JSON.stringify(JSON.stringify(r.schema))})'>载入为新草稿</button></td></tr>`).join("");
   return `
-  <div class="card"><b>评价标准与标签库</b>
-    <p class="muted small">维度锚点 0-3 齐全才能发布（TC012）；发布后产生新版本，
-    旧报告只读，不与新标准直接比较（TC013）。标准变化会使评价器进入 stale（TC024）。</p>
+  <div class="card"><b>评价标准</b>
+    <p class="muted small">维度锚点 0-3 齐全才能发布（TC012）；标准变化会使评价器进入 stale（TC024）。</p>
     <table><tr><th>版本</th><th>状态</th><th>维度</th><th>哈希</th><th>操作</th></tr>${rows}</table>
   </div>
   <div class="card">
     <b>草稿编辑</b>
-    <button class="ghost" onclick="newRubricDraft()">从任务模板新建草稿</button>
+    <button class="ghost" onclick="newRubricDraft()">从任务契约新建草稿</button>
     <label>标准 JSON（dimensions[].name/anchors{0,1,2,3}）</label>
     <textarea id="rubric-json" style="min-height:220px"></textarea>
     <div style="margin-top:8px"><button onclick="saveRubric()">保存草稿</button>
@@ -255,7 +1184,7 @@ PAGES.rubric = async (p) => {
 async function newRubricDraft() {
   const r = await api("POST", `/projects/${state.pid}/rubrics`);
   document.getElementById("rubric-json").value = JSON.stringify(r.schema, null, 2);
-  toast("已按任务模板生成草稿 " + r.id);
+  toast("已按任务契约生成草稿 " + r.id);
 }
 let _editRubricId = "";
 function editRubric(schemaJson) {
@@ -273,32 +1202,26 @@ async function saveRubric(publish) {
       r = await api("PUT", `/rubrics/${_editRubricId}`, schema); _editRubricId = "";
     } else {
       r = await api("POST", `/projects/${state.pid}/rubrics`);
-      // 草稿已创建，直接写入其内容再按需发布
       r = await api("PUT", `/rubrics/${r.id}`, schema);
     }
     if (publish) r = await api("POST", `/rubrics/${r.id}/publish`);
     toast(publish ? "已发布：" + r.id : "草稿已保存");
     route();
-  } catch (e) {
-    const fe = e.body && e.body.field_errors
-      ? "\n" + Object.entries(e.body.field_errors).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
-    toast(e.message + fe, true);
-  }
+  } catch (e) { toast(errText(e), true); }
 }
 async function publishRubric(rid) {
   try { await api("POST", `/rubrics/${rid}/publish`); toast("已发布；旧评价器已标记stale"); route(); }
-  catch (e) { toast(e.message, true); }
+  catch (e) { toast(errText(e), true); }
 }
 
-/* ---------------- P05/P06 标注 ---------------- */
+/* ---------------- 高级功能：人工标注 ---------------- */
 PAGES.annotation = async (p) => {
   const outs = await api("GET", `/projects/${p.id}/outputs?limit=200`);
   const opts = outs.outputs.map(o =>
     `<option value="${o.id}">${o.id.slice(0, 14)}…（运行 ${esc((o.run_id || "").slice(0, 14))}，状态 ${esc(o.status)}）</option>`).join("");
   return `
-  <div class="card"><b>创建匿名 A/B 对比（P05 队列入口）</b>
-    <p class="muted small">盲评视图不返回版本ID、名称、时间或评分（TC018）；
-    偏好支持 tie / both_unusable / unknown，不强选胜者（TC019）。</p>
+  <div class="card"><b>创建匿名 A/B 对比</b>
+    <p class="muted small">盲评视图不返回版本ID、名称、时间或评分（TC018）；偏好支持 tie / both_unusable / unknown（TC019）。</p>
     <div class="flex">
       <div><label>左侧输出</label><select id="pair-left">${opts}</select></div>
       <div><label>右侧输出</label><select id="pair-right">${opts}</select></div>
@@ -314,11 +1237,11 @@ PAGES.annotation = async (p) => {
 };
 async function createPair() {
   const l = document.getElementById("pair-left").value, r = document.getElementById("pair-right").value;
-  if (!l || !r) { toast("需要至少两个已存在的输出（先在 P09 试运行或 P11 运行实验）", true); return; }
+  if (!l || !r) { toast("需要至少两个已存在的输出（先试运行或运行实验）", true); return; }
   const pr = await api("POST", `/projects/${state.pid}/pairs`,
     { left_output_id: l, right_output_id: r, purpose: "blind_ab" });
   document.getElementById("blind-id").value = pr.public_id;
-  toast("对比已创建（映射只存服务端）：" + pr.public_id);
+  toast("对比已创建：" + pr.public_id);
   loadBlind();
 }
 async function loadBlind() {
@@ -337,7 +1260,7 @@ async function loadBlind() {
     </select>
     <label>理由（简短）</label><input id="blind-reason">
     <div style="margin-top:8px"><button onclick="submitBlind('${pid}')">提交标注</button>
-    <button class="grey" onclick="revealPair('${pid}')">提交后揭示真实版本（负责人）</button></div>`;
+    <button class="grey" onclick="revealPair('${pid}')">提交后揭示真实版本</button></div>`;
 }
 async function submitBlind(pid) {
   const payload = { preference: document.getElementById("blind-pref").value,
@@ -350,7 +1273,7 @@ async function revealPair(pid) {
   toast(`真实映射：左=${r.left_output_id.slice(0, 14)}…，右=${r.right_output_id.slice(0, 14)}…`);
 }
 
-/* ---------------- P07 评价器 ---------------- */
+/* ---------------- 高级功能：评价器校准 ---------------- */
 PAGES.judge = async (p) => {
   const [rs, js, conns] = await Promise.all([
     api("GET", `/projects/${p.id}/rubrics`), api("GET", `/projects/${p.id}/judges`),
@@ -362,8 +1285,7 @@ PAGES.judge = async (p) => {
     <tr><td>v${j.version_no}</td><td>${pill(j.status, j.status === "audited" ? "ok" :
       j.status === "stale" ? "bad" : "warn")}</td>
     <td class="small">构建 ${j.build_refs.length} / 审计 ${j.audit_refs.length}</td>
-    <td class="small">${j.metrics && j.metrics.audit ? `审计n=${j.metrics.audit.n}` : "未校准"}</td>
-    <td><button class="grey" onclick="showJudge('${j.id}')">详情</button></td></tr>`).join("");
+    <td class="small">${j.metrics && j.metrics.audit ? `审计n=${j.metrics.audit.n}` : "未校准"}</td></tr>`).join("");
   return `
   <div class="card"><b>创建评价器</b>
     <div class="flex">
@@ -375,12 +1297,11 @@ PAGES.judge = async (p) => {
   <div class="card"><b>校准（构建集/审计集必须来源隔离 TC021）</b>
     <label>构建集输出ID（每行一个，需人工核验gold）</label><textarea id="jdg-build" placeholder="out_..."></textarea>
     <label>审计集输出ID（独立来源，每行一个）</label><textarea id="jdg-audit"></textarea>
-    <div style="margin-top:8px"><button onclick="calibrateJudge()">运行校准</button>
-    <span class="muted small">模型预标注不能作为gold（TC020）；审计样本不足不能声称可靠（TC022）</span></div>
+    <div style="margin-top:8px"><button onclick="calibrateJudge()">运行校准</button></div>
     <pre id="jdg-out" class="hidden"></pre>
   </div>
   <div class="card"><b>评价器列表</b>
-    <table><tr><th>版本</th><th>状态</th><th>规模</th><th>指标</th><th></th></tr>${rows}</table>
+    <table><tr><th>版本</th><th>状态</th><th>规模</th><th>指标</th></tr>${rows}</table>
   </div>`;
 };
 async function createJudge() {
@@ -402,16 +1323,10 @@ async function calibrateJudge() {
     const out = document.getElementById("jdg-out");
     out.classList.remove("hidden");
     out.textContent = "状态：" + r.status + "\n" + JSON.stringify(r.metrics, null, 2);
-  } catch (e) { toast(e.message, true); }
-}
-async function showJudge(jid) {
-  const j = await api("GET", `/judges/${jid}`);
-  const out = document.getElementById("jdg-out");
-  out.classList.remove("hidden");
-  out.textContent = JSON.stringify(j.metrics, null, 2);
+  } catch (e) { toast(errText(e), true); }
 }
 
-/* ---------------- P08 提示词库 ---------------- */
+/* ---------------- 高级功能：提示词库 ---------------- */
 PAGES.prompts = async (p) => {
   const ps = await api("GET", `/projects/${p.id}/prompts`);
   const rel = await api("GET", `/projects/${p.id}/releases`);
@@ -419,28 +1334,29 @@ PAGES.prompts = async (p) => {
     <tr><td class="small">${esc(v.name)}</td><td>v${v.version_no}</td>
     <td>${pill(v.origin === "optimizer" ? "优化候选" : "人工", v.origin === "optimizer" ? "brand" : "")}</td>
     <td class="small">${esc(v.variables.join("、"))}</td>
+    <td class="small">${v.length || v.body.length} 字</td>
     <td class="small">${esc(v.hash.slice(0, 10))}</td>
-    <td>${rel.current && rel.current.prompt_version_id === v.id ? pill("当前使用", "ok") : ""}</td>
-    <td class="small">${esc(v.hypothesis || "")}</td></tr>`).join("");
+    <td>${rel.current && rel.current.prompt_version_id === v.id ? pill("当前使用", "ok") : ""}
+    <button class="grey" onclick="copyPrompt('${v.id}')">复制</button></td>
+    <td class="small" style="white-space:normal">${esc(v.hypothesis || "")}</td></tr>`).join("");
   const runtimeFields = p.contract.runtime_fields.map(f => f.name).join("、");
   return `
   <div class="card"><b>提示词版本库</b>
-    <p class="muted small">运行时白名单变量：${esc(runtimeFields)}。
-    实验引用明确版本ID，不引用 latest（TC031）；新增版本不改变当前使用指针（TC025）。</p>
-    <table><tr><th>名称</th><th>版本</th><th>来源</th><th>变量</th><th>哈希</th><th>指针</th><th>假设</th></tr>${rows}</table>
+    <p class="muted small">运行时白名单变量：${esc(runtimeFields)}。实验引用明确版本ID（TC031）；新增版本不改变当前使用指针（TC025）。</p>
+    <table><tr><th>名称</th><th>版本</th><th>来源</th><th>变量</th><th>长度</th><th>哈希</th><th>指针</th><th>假设</th></tr>${rows}</table>
   </div>
   <div class="card"><b>新建版本</b>
-    <label>名称</label><input id="pv-name" value="学员点评提示词">
+    <label>名称</label><input id="pv-name" value="人工修改版">
     <label>正文（可用 {{变量}}）</label>
-    <textarea id="pv-body">你是一名教研老师。请根据题目、学员答案与学段，给出一份学员作答点评。</textarea>
+    <textarea id="pv-body"></textarea>
     <label>变量（逗号分隔，必须属于白名单）</label>
-    <input id="pv-vars" value="question,student_answer,grade_level">
+    <input id="pv-vars" value="${esc(runtimeFields)}">
     <label>冻结组件（JSON数组，可空）</label>
-    <input id="pv-frozen" value='[{"name":"安全声明","text":"不得虚构学员错误。"}]'>
-    <div style="margin-top:8px"><button onclick="createPrompt()">创建新版本</button></div>
+    <input id="pv-frozen" value='[]'>
+    <div style="margin-top:8px"><button onclick="createPromptAdv()">创建新版本</button></div>
   </div>`;
 };
-async function createPrompt() {
+async function createPromptAdv() {
   const frozen = document.getElementById("pv-frozen").value.trim();
   try {
     await api("POST", `/projects/${state.pid}/prompts`, {
@@ -450,10 +1366,10 @@ async function createPrompt() {
       frozen_segments: frozen ? JSON.parse(frozen) : [], params: {} });
     toast("新版本已创建（不改变当前使用指针）");
     route();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { toast(errText(e), true); }
 }
 
-/* ---------------- P09 编辑与试运行 ---------------- */
+/* ---------------- 高级功能：试运行 ---------------- */
 PAGES.playground = async (p) => {
   const [ps, items] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/items?size=100`)]);
@@ -485,17 +1401,18 @@ async function trial() {
   document.getElementById("tr-out").innerHTML = `
     <div style="margin-top:10px"><b>输出（${r.generation.status}）</b>
     <div class="out-text">${esc(r.generation.text || r.generation.error || "")}</div>
-    ${r.evaluation ? `<b>模拟评价</b><pre>${esc(JSON.stringify(r.evaluation, null, 2))}</pre>` : ""}</div>`;
+    ${r.evaluation ? `<b>评价</b><pre>${esc(JSON.stringify(r.evaluation, null, 2))}</pre>` : ""}</div>`;
 }
 async function diffPrompt() {
   const a = document.getElementById("df-a").value, b = document.getElementById("df-b").value;
   const d = await api("GET", `/prompts/${a}/diff?b_id=${encodeURIComponent(b)}`);
   const out = document.getElementById("df-out");
   out.classList.remove("hidden");
-  out.textContent = `正文不同：${d.body_changed}；参数不同：${d.params_changed}；冻结段不同：${d.frozen_changed}`;
+  out.textContent = `正文不同：${d.body_changed}；参数不同：${d.params_changed}；冻结段不同：${d.frozen_changed}\n\n` +
+    `--- A 正文 ---\n${d.a_body}\n\n--- B 正文 ---\n${d.b_body}`;
 }
 
-/* ---------------- P10 实验配置 ---------------- */
+/* ---------------- 高级功能：实验配置 ---------------- */
 PAGES.experiment = async (p) => {
   const [ps, mans, rs, js, conns] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/manifests`),
@@ -513,9 +1430,8 @@ PAGES.experiment = async (p) => {
   const devIds = devItems.items.map(i => i.id), selIds = selItems.items.map(i => i.id);
   window._devIds = devIds; window._selIds = selIds;
   return `
-  <div class="card"><b>实验配置与启动（P10）</b>
-    <p class="muted small">配置快照固定全部版本；搜索与验收预算分列，搜索耗尽不占验收预留（TC033）；
-    价格未知时只能用 token 上限模式（TC032）；双击幂等只建一次（TC035）。</p>
+  <div class="card"><b>实验配置与启动（高级）</b>
+    <p class="muted small">配置快照固定全部版本；搜索与验收预算分列（TC033）；价格未知时只能用 token 上限模式（TC032）；双击幂等（TC035）。</p>
     <div class="grid2">
       <div><label>基线提示词版本</label><select id="ex-pv">${pvOpts}</select></div>
       <div><label>切分清单</label><select id="ex-man">${manOpts}</select></div>
@@ -524,21 +1440,23 @@ PAGES.experiment = async (p) => {
       <div><label>模式</label><select id="ex-mode"><option value="explore">explore 探索</option>
         <option value="batch">batch 批量</option></select></div>
       <div><label>生成/评价/优化连接</label><select id="ex-conn">${connOpts}</select></div>
-      <div><label>候选数</label><input id="ex-cand" type="number" value="2"></div>
+      <div><label>优化轮数上限</label><input id="ex-cand" type="number" value="3"></div>
       <div><label>开发集抽样</label><input id="ex-sample" type="number" value="8"></div>
-      <div><label>最小提升阈值</label><input id="ex-delta" type="number" step="0.01" value="0.02"></div>
+      <div><label>最小提升阈值</label><input id="ex-delta" type="number" step="0.01" value="0.05"></div>
+      <div><label>连续无改善停止（轮）</label><input id="ex-stall" type="number" value="2"></div>
+      <div><label>提示词长度上限（字）</label><input id="ex-len" type="number" value="4000"></div>
+      <div><label>人工参与模式</label><select id="ex-human"><option value="">自动连续执行</option>
+        <option value="1">每轮等待人工评价</option></select></div>
       <div><label>预算模式</label><select id="ex-bmode"><option value="token">token</option>
         <option value="money">money</option></select></div>
       <div><label>总额度</label><input id="ex-btotal" type="number" value="2000000"></div>
       <div><label>搜索额度</label><input id="ex-bsearch" type="number" value="1200000"></div>
       <div><label>验收预留</label><input id="ex-baccept" type="number" value="600000"></div>
     </div>
-    <div class="small muted" style="margin-top:6px">开发集 ${devIds.length} 条 / 选择集 ${selIds.length} 条
-    将按快照写入（引用明确版本）</div>
+    <div class="small muted" style="margin-top:6px">开发集 ${devIds.length} 条 / 选择集 ${selIds.length} 条将按快照写入</div>
     <div style="margin-top:10px">
       <button class="ghost" onclick="validateRun()">校验并预估</button>
-      <button onclick="startRun()">启动实验</button>
-      <span id="ex-est" class="small muted"></span>
+      <button onclick="startRunAdv()">启动实验</button>
     </div>
     <pre id="ex-out" class="hidden"></pre>
   </div>`;
@@ -554,9 +1472,12 @@ function collectDraft() {
     data: { dev_item_ids: window._devIds, select_item_ids: window._selIds },
     models: { generation: { connection_id: conn }, evaluation: { connection_id: conn },
               optimizer: { connection_id: conn } },
-    optimization: { max_candidates: +document.getElementById("ex-cand").value,
+    optimization: { max_rounds: +document.getElementById("ex-cand").value,
       dev_sample_size: +document.getElementById("ex-sample").value,
-      min_delta: +document.getElementById("ex-delta").value },
+      min_delta: +document.getElementById("ex-delta").value,
+      stall_rounds: +document.getElementById("ex-stall").value,
+      length_limit_chars: +document.getElementById("ex-len").value,
+      human_in_loop: !!document.getElementById("ex-human").value },
     budget: { mode: document.getElementById("ex-bmode").value,
       total_limit: +document.getElementById("ex-btotal").value,
       search_limit: +document.getElementById("ex-bsearch").value,
@@ -570,138 +1491,42 @@ async function validateRun() {
     document.getElementById("ex-out").textContent =
       "校验通过。\n" + JSON.stringify(r.estimate, null, 2);
   } catch (e) {
-    const fe = e.body && e.body.field_errors
-      ? "\n" + Object.entries(e.body.field_errors).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
     document.getElementById("ex-out").classList.remove("hidden");
-    document.getElementById("ex-out").textContent = e.message + fe;
+    document.getElementById("ex-out").textContent = errText(e);
   }
 }
-async function startRun() {
+async function startRunAdv() {
   try {
     const r = await api("POST", `/projects/${state.pid}/runs`, collectDraft(),
       { "Idempotency-Key": "ui-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) });
-    toast("实验已启动：" + r.id + "（幂等键保护双击）");
-    location.hash = `#/proj/${state.pid}/runs`;
-  } catch (e) { toast(e.message, true); }
+    toast("实验已启动：" + r.id);
+    location.hash = `#/proj/${state.pid}/run/${r.id}`;
+  } catch (e) { toast(errText(e), true); }
 }
 
-/* ---------------- P11 实验运行 ---------------- */
-PAGES.runs = async (p) => {
-  const rs = await api("GET", `/projects/${p.id}/runs`);
-  const rows = rs.runs.map(r => `
-    <tr><td class="small">${esc(r.id)}</td>
-    <td>${pill(r.state, r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}</td>
-    <td class="small">${esc(r.stop_reason || "")}</td>
-    <td class="small">${(r.candidates || []).length} 个候选</td>
-    <td><a href="#/proj/${p.id}/runs" onclick="showRun('${r.id}')">详情</a></td></tr>`).join("");
-  return `
-  <div class="card"><b>运行列表</b>
-    <table><tr><th>运行</th><th>状态</th><th>停止原因</th><th>候选</th><th></th></tr>${rows}</table>
-  </div>
-  <div id="run-detail"></div>`;
-};
-let _pollTimer = null;
-async function showRun(rid) {
-  clearInterval(_pollTimer);
-  const r = await api("GET", `/runs/${rid}`);
-  const led = await api("GET", `/runs/${rid}/ledger`);
-  const cands = (r.candidates || []).map(c => `
-    <tr><td class="small">${esc(c.candidate_id)}</td><td class="small">${esc(c.prompt_version_id)}</td>
-    <td>${c.score != null ? c.score.toFixed(3) : ""}</td>
-    <td>${c.usable_rate != null ? (c.usable_rate * 100).toFixed(0) + "%" : ""}</td>
-    <td>${c.severe || 0}</td>
-    <td><button onclick="lockCand('${rid}','${c.candidate_id}')" ${r.locked_candidate ? "disabled" : ""}>锁定</button></td></tr>`).join("");
-  document.getElementById("run-detail").innerHTML = `
-  <div class="card"><b>运行 ${esc(r.id)}</b> ${pill(r.state, r.state === "completed" ? "ok" : "warn")}
-    <div class="kv" style="margin-top:8px">
-      <div>快照哈希</div><div class="small">${esc(r.snapshot_hash.slice(0, 24))}…</div>
-      <div>停止原因</div><div>${esc(r.stop_reason || "-")}</div>
-      <div>锁定候选</div><div>${esc(r.locked_candidate || "未锁定")}</div>
-      <div>预算（已用/在途）</div><div class="small">${esc(JSON.stringify(r.budget.spent))} / ${esc(JSON.stringify(r.budget.reserved))}</div>
-      <div>账本对账</div><div class="small">确定 ${led.known_tokens} tok；未知在途 ${led.unknown_tokens} tok（sent_unknown单列，TC057）</div>
-    </div>
-    <div style="margin-top:8px">
-      <button class="danger" onclick="cancelRun('${rid}',${r.revision})">取消（协作停止）</button>
-      ${r.state === "paused_budget" ? `<button onclick="resumeRun('${rid}')">恢复运行</button>` : ""}
-      <button class="ghost" onclick="pollEvents('${rid}',0)">刷新事件</button>
-      ${r.state === "completed" && r.locked_candidate ? `<button onclick="location.hash='#/proj/${state.pid}/acceptance'">去独立验收 →</button>` : ""}
-    </div>
-    <h2>候选</h2>
-    <table><tr><th>候选</th><th>版本</th><th>平均分</th><th>可用率</th><th>严重</th><th></th></tr>${cands}</table>
-    <h2>事件流</h2><pre id="ev-out" class="small">点击"刷新事件"加载（断线可按游标恢复）</pre>
-  </div>`;
-  pollEvents(rid, 0);
-  if (r.state === "running") _pollTimer = setInterval(() => pollEvents(rid, window._evCursor || 0), 2500);
-}
-async function pollEvents(rid, cursor) {
-  const r = await api("GET", `/runs/${rid}/events?cursor=${cursor}`);
-  window._evCursor = r.events.length ? r.events[r.events.length - 1].seq : cursor;
-  const el = document.getElementById("ev-out");
-  if (el && r.events.length) {
-    el.textContent += r.events.map(e => `[${e.seq}] ${e.type} ${JSON.stringify(e.payload)}`).join("\n") + "\n";
-  }
-}
-async function lockCand(rid, cid) {
-  try { await api("POST", `/runs/${rid}/lock`, { candidate_id: cid }); toast("已锁定：" + cid); showRun(rid); }
-  catch (e) { toast(e.message, true); }
-}
-async function cancelRun(rid, revision) {
-  try { await api("POST", `/runs/${rid}/cancel`, { revision }); toast("已请求取消：停止派发，在途结果仍入账"); showRun(rid); }
-  catch (e) { toast(e.message, true); }
-}
-async function resumeRun(rid) {
-  await api("POST", `/runs/${rid}/resume`); toast("已恢复"); showRun(rid);
-}
-
-/* ---------------- P12 独立验收 ---------------- */
+/* ---------------- 高级功能：验收报告 ---------------- */
 PAGES.acceptance = async (p) => {
-  const [rs, reps] = await Promise.all([
+  const [runs, reps] = await Promise.all([
     api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/reports`)]);
-  const done = rs.runs.filter(r => r.state === "completed");
+  const done = runs.runs.filter(r => r.state === "completed");
   const runOpts = done.map(r => `<option value="${r.id}">${esc(r.id)}（锁定：${esc(r.locked_candidate || "未锁定")}）</option>`).join("");
   const repRows = reps.reports.map(r => `
-    <tr><td class="small">${esc(r.id)}</td>
-    <td>${pill(r.decision, r.decision === "verified_improvement" ? "ok" :
-      r.decision === "regression" ? "bad" : "warn")}</td>
+    <tr><td class="small">${esc(r.id)}</td><td>${decisionPill(r.decision)}</td>
     <td>${(r.stats.diff * 100).toFixed(1)}pp</td>
-    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td>
-    <td><button class="grey" onclick="showReport('${r.id}')">查看</button></td></tr>`).join("");
+    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td></tr>`).join("");
   return `
-  <div class="card"><b>发起独立验收（P12）</b>
-    <p class="muted small">必须先锁定候选（TC042）；解封消耗封存测试集，已消耗不能再次作为独立证明（TC043）。
-    结论只有五类：verified_improvement / no_improvement / regression / inconclusive / evaluation_invalid。</p>
+  <div class="card"><b>发起独立验收</b>
+    <p class="muted small">必须先锁定候选（TC042）；解封消耗封存测试集（TC043）。</p>
     <div class="flex"><div><label>已完成的运行</label><select id="acc-run">${runOpts}</select></div>
     <div style="flex:0"><button onclick="acceptRun()">解封并验收</button></div></div>
   </div>
   <div class="card"><b>验收报告</b>
-    <table><tr><th>报告</th><th>结论</th><th>配对差异</th><th>规模</th><th></th></tr>${repRows}</table>
-    <pre id="rep-out" class="hidden"></pre>
+    ${reps.reports.length ? `<table><tr><th>报告</th><th>结论</th><th>配对差异</th><th>规模</th></tr>${repRows}</table>`
+      : `<p class="muted small">暂无报告。</p>`}
   </div>`;
 };
-async function acceptRun() {
-  const rid = document.getElementById("acc-run").value;
-  if (!rid) { toast("暂无可验收的运行", true); return; }
-  try { const r = await api("POST", `/runs/${rid}/accept`); toast("验收完成：" + r.decision); route(); }
-  catch (e) { toast(e.message, true); }
-}
-async function showReport(rid) {
-  const r = await api("GET", `/reports/${rid}`);
-  const s = r.stats;
-  const out = document.getElementById("rep-out");
-  out.classList.remove("hidden");
-  out.textContent = [
-    `结论：${r.decision}（不可变报告，TC013）`,
-    `主指标：${s.primary_metric || "-"}`,
-    `基线可用率 ${(s.baseline_usable_rate * 100).toFixed(1)}% → 候选 ${(s.candidate_usable_rate * 100).toFixed(1)}%，差异 ${(s.diff * 100).toFixed(1)}pp`,
-    `修复 ${s.fix} / 退步 ${s.regress} / 双可用 ${s.both} / 双不可用 ${s.neither}；来源n=${s.group_n}`,
-    `精确McNemar双侧p=${s.mcnemar_p.toFixed(6)}；bootstrap 95%CI=[${(s.bootstrap.ci_low * 100).toFixed(1)}pp, ${(s.bootstrap.ci_high * 100).toFixed(1)}pp]`,
-    `缺失界限：${(s.missing_bounds.low * 100).toFixed(1)}%–${(s.missing_bounds.high * 100).toFixed(1)}%（未知${s.missing_bounds.unknown_n}条不删除）`,
-    `严重错误：基线 ${s.severe_baseline}，候选 ${s.severe_candidate}${s.severe_upper_bound_95 != null ? `；零事件95%上界 ${(s.severe_upper_bound_95 * 100).toFixed(2)}%（不等于真实零风险）` : ""}`,
-    s.severe_note,
-  ].filter(Boolean).join("\n");
-}
 
-/* ---------------- P13 使用与反馈 ---------------- */
+/* ---------------- 高级功能：使用与反馈 ---------------- */
 PAGES.usage = async (p) => {
   const [rel, reps, ps, fb] = await Promise.all([
     api("GET", `/projects/${p.id}/releases`), api("GET", `/projects/${p.id}/reports`),
@@ -712,8 +1537,7 @@ PAGES.usage = async (p) => {
   const hist = rel.history.map(h => `
     <tr><td class="small">${esc(h.id)}</td><td class="small">${esc(h.prompt_version_id)}</td>
     <td>${pill(h.status, h.status === "active" ? "ok" : h.status === "trial" ? "warn" : "")}</td>
-    <td class="small">${esc(h.created_at)}</td>
-    <td>${h.status === "active" ? `<button class="grey" onclick="prepRollback('${h.id}')">准备回滚</button>` : ""}</td></tr>`).join("");
+    <td class="small">${esc(h.created_at)}</td></tr>`).join("");
   const fbRows = fb.feedback.map(f => `
     <tr><td class="small">${esc(f.adoption)}</td><td class="small">${esc(f.reason)}</td>
     <td class="small">${esc(f.status)}</td><td class="small">${esc(f.created_at)}</td></tr>`).join("");
@@ -735,11 +1559,7 @@ PAGES.usage = async (p) => {
     </div>
   </div>
   <div class="card"><b>发布历史与回滚</b>
-    <table><tr><th>发布</th><th>版本</th><th>状态</th><th>时间</th><th></th></tr>${hist}</table>
-    <div class="flex" style="margin-top:8px">
-      <div><label>回滚目标发布ID</label><input id="rb-target"></div>
-      <div style="flex:0"><label> </label><button class="danger" onclick="rollback()">回滚（产生新事件，不删历史）</button></div>
-    </div>
+    <table><tr><th>发布</th><th>版本</th><th>状态</th><th>时间</th></tr>${hist}</table>
   </div>
   <div class="card"><b>使用反馈</b>
     <div class="flex">
@@ -747,11 +1567,10 @@ PAGES.usage = async (p) => {
       <div><label>采用状态</label><select id="fb-adopt"><option value="direct">直接采用</option>
         <option value="minor_edit">轻微修改</option><option value="major_edit">实质修改</option>
         <option value="abandoned">放弃</option></select></div>
-      <div><label>修改耗时</label><input id="fb-time" placeholder="如 15分钟"></div>
       <div><label>原因</label><input id="fb-reason"></div>
       <div style="flex:0"><label> </label><button onclick="sendFeedback()">提交反馈</button></div>
     </div>
-    <p class="muted small">未反馈按 missing 展示，不视为满意（TC050）；反馈回流进待核验池，不自动成为测试gold。</p>
+    <p class="muted small">反馈回流进待核验池，不自动成为测试gold（TC050）。</p>
     <table><tr><th>采用</th><th>原因</th><th>状态</th><th>时间</th></tr>${fbRows}</table>
   </div>`;
 };
@@ -759,36 +1578,23 @@ async function release(mode) {
   try {
     await api("POST", `/projects/${state.pid}/releases`, {
       prompt_version_id: document.getElementById("rel-pv").value,
-      report_ref: document.getElementById("rel-rep").value,
-      mode });
+      report_ref: document.getElementById("rel-rep").value, mode });
     toast(mode === "active" ? "已正式采用（指针已更新）" : "已保存为试用，不影响正式指针");
     route();
-  } catch (e) { toast(e.message, true); }
-}
-function prepRollback(id) { document.getElementById("rb-target").value = id; }
-async function rollback() {
-  const cur = (await api("GET", `/projects/${state.pid}/releases`)).current;
-  if (!cur) { toast("当前没有active发布", true); return; }
-  try {
-    await api("POST", `/releases/${cur.id}/rollback`,
-      { target_release_id: document.getElementById("rb-target").value });
-    toast("已回滚：恢复目标版本的文本、模型与模板；历史保留");
-    route();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { toast(errText(e), true); }
 }
 async function sendFeedback() {
   try {
     await api("POST", `/releases/${document.getElementById("fb-rel").value}/feedback`, {
       adoption: document.getElementById("fb-adopt").value,
-      edit_time: document.getElementById("fb-time").value,
       reason: document.getElementById("fb-reason").value });
     toast("反馈已记录（进入待核验池）");
     route();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { toast(errText(e), true); }
 }
 
-/* ---------------- P14 设置 ---------------- */
-PAGES.settings = async (p) => {
+/* ---------------- 模型设置（项目内外均可用，§4.1） ---------------- */
+async function settingsHtml() {
   const [conns, prices] = await Promise.all([
     api("GET", "/settings/connections"), api("GET", "/settings/prices")]);
   const rows = conns.connections.map(c => `
@@ -798,9 +1604,9 @@ PAGES.settings = async (p) => {
     <td class="small">${c.api_key ? pill("密钥已配置", "ok") : pill("无密钥", "")}</td>
     <td><button class="grey" onclick="testConn('${c.id}')">测试</button></td></tr>`).join("");
   return `
-  <div class="card"><b>模型连接</b>
-    <p class="muted small">密钥只保存在本机数据库，界面只显示"已配置"，导出与日志不含密钥（TC051）。
-    内置模拟供应商可离线跑通全部流程；真实使用请添加 OpenAI 兼容连接（智谱/DeepSeek/OpenAI等）。</p>
+  <div class="card"><b>模型连接（未创建项目时也可进入）</b>
+    <p class="muted small">密钥只保存在本机数据库（TC051）。内置模拟供应商可离线跑通全部流程（演示模式）；
+    真实使用请添加 OpenAI 兼容连接（智谱/DeepSeek/OpenAI等）。</p>
     <table><tr><th>ID</th><th>名称</th><th>类型</th><th>模型</th><th>密钥</th><th></th></tr>${rows}</table>
     <div class="grid2" style="margin-top:10px">
       <div><label>名称</label><input id="cn-name" placeholder="例如：智谱GLM"></div>
@@ -816,12 +1622,12 @@ PAGES.settings = async (p) => {
     <label>JSON：{"模型名": {"in_per_1k": 0.001, "out_per_1k": 0.002, "currency": "CNY"}}</label>
     <textarea id="price-json">${esc(JSON.stringify(prices.prices, null, 2))}</textarea>
     <div style="margin-top:8px"><button onclick="savePrices()">保存价格表</button></div>
-  </div>
-  <div class="card"><b>诊断（脱敏导出）</b>
-    <button class="ghost" onclick="showDiag()">生成诊断</button>
-    <pre id="diag-out" class="hidden"></pre>
   </div>`;
-};
+}
+async function pageSettingsGlobal() {
+  setMain(await settingsHtml());
+}
+PAGES.settings = async (p) => settingsHtml();
 async function addConn() {
   await api("PUT", "/settings/connections", {
     name: document.getElementById("cn-name").value,
@@ -842,12 +1648,6 @@ async function savePrices() {
     await api("PUT", "/settings/prices", prices);
     toast("价格表已保存");
   } catch (e) { toast("JSON 解析失败：" + e.message, true); }
-}
-async function showDiag() {
-  const d = await api("GET", "/settings/diagnostics");
-  const out = document.getElementById("diag-out");
-  out.classList.remove("hidden");
-  out.textContent = JSON.stringify(d, null, 2);
 }
 
 /* ---------------- 启动 ---------------- */

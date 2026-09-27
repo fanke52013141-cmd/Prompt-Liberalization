@@ -165,6 +165,25 @@ class MockProvider:
             item_key = mi.group(1)
 
         if role == "evaluation":
+            # 问题核查分支：<problem_check> 标记时按输出特征逐项判定专家问题状态
+            if "<problem_check>" in flat:
+                ids = re.findall(r"id=([A-Za-z0-9_\-]+)", flat)
+                text_payload = re.search(r"<output>([\s\S]*?)</output>", flat)
+                output_text = text_payload.group(1) if text_payload else ""
+                if _SEVERE_MARKER in output_text:
+                    status = "unresolved"
+                elif "定位：具体" in output_text:
+                    status = "resolved"
+                elif "定位：" in output_text:
+                    status = "partial"
+                else:
+                    status = "unknown"
+                body = json.dumps({"problems": [{"id": i, "status": status,
+                                                 "note": "模拟判定：按输出特征（演示）"}
+                                                for i in ids]},
+                                  ensure_ascii=False)
+                usage = {"in": 150 + len(flat) // 2, "out": 40 + len(body) // 2}
+                return CallResult(body, "stop", usage)
             dims = re.findall(r"维度[：:]\s*([^\n]+)", flat)
             dims = [d.strip() for d in dims if d.strip()]
             text_payload = re.search(r"<output>([\s\S]*?)</output>", flat)
@@ -185,12 +204,31 @@ class MockProvider:
         # generation / optimizer
         q = prompt_quality(flat)
         if role == "optimizer":
-            # 反思模型：根据失败维度生成候选改写片段（演示版为确定性模板建议）
-            body = json.dumps({"fragment_suggestion":
-                               "输出要求：先给结论，明确判断对错并说明依据；再具体定位出错的步骤；"
-                               "最后给出可执行建议：按以下步骤修改：1) 复核定义；2) 重写该步；3) 对照核对。"},
-                              ensure_ascii=False)
-            usage = {"in": 120 + len(flat) // 2, "out": 90}
+            # 反思模型：基于完整证据返回完整新正文（演示版为确定性策略）。
+            # 若当前正文已包含分层建议（先给结论…），认为证据已被覆盖，原样返回并说明依据不足。
+            body_m = re.search(r"<current_prompt>\n?([\s\S]*?)\n?</current_prompt>", flat)
+            current_body = body_m.group(1) if body_m else ""
+            if inject == "optimizer_bad_json":
+                return CallResult("这不是JSON输出{改写失败演示", "stop",
+                                  {"in": 120 + len(flat) // 2, "out": 30})
+            if "先给结论" in current_body:
+                body = json.dumps(
+                    {"hypothesis": "证据不足：当前正文已包含结论-定位-可执行建议的分层要求，"
+                                   "没有新的失败模式支持进一步修改；归因应视为待验证假设。",
+                     "new_body": current_body,
+                     "change_summary": "无修改（无新增依据）"},
+                    ensure_ascii=False)
+            else:
+                suggestion = ("输出要求：先给结论，明确判断对错并说明依据；再具体定位出错的步骤；"
+                              "最后给出可执行建议：按以下步骤修改：1) 复核定义；2) 重写该步；"
+                              "3) 对照核对。")
+                body = json.dumps(
+                    {"hypothesis": "失败案例集中在归因含混与定位缺失：在正文尾部增加"
+                                   "“结论-定位-可执行建议”三层输出要求，预计减少含混点评。",
+                     "new_body": current_body.rstrip() + "\n\n" + suggestion,
+                     "change_summary": "追加输出结构要求：结论先行、具体定位、可执行建议三步"},
+                    ensure_ascii=False)
+            usage = {"in": 120 + len(flat) // 2, "out": 90 + len(body) // 2}
             return CallResult(body, "stop", usage)
 
         text = _render_output(min(0.98, max(0.05, q + _item_noise(item_key or fingerprint))), task_label)
