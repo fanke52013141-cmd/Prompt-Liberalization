@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conftest import setup_project_with_data, wait_run  # noqa: E402
+from conftest import setup_project_with_data, start_run, wait_run  # noqa: E402
 
 API = "/workflow-api/v1"
 
@@ -478,3 +478,28 @@ def test_custom_project_rubric_draft_generic_and_contract_dims(client):
     r2 = client.post(f"{API}/projects/{p2['id']}/rubrics").json()
     assert [d["name"] for d in r2["schema"]["dimensions"]] == ["洞察深入", "分镜可执行"]
     assert client.post(f"{API}/rubrics/{r2['id']}/publish").status_code == 200
+
+
+# ---------------- 预算状态与账本一致性（演练中发现的覆盖 bug 回归） ----------------
+
+def test_run_budget_state_matches_ledger_after_run(client):
+    """运行结束（含独立验收）后：runs.budget_state_json 的分阶段用量
+    必须等于账本同一阶段 ok 尝试的实际用量之和（评价调用不得自行记账覆盖）。"""
+    s = setup_project_with_data(client)
+    run = start_run(client, s["pid"], s["prompt_id"], s["rubric_id"],
+                    dev_ids=s["item_ids"][:3], max_candidates=1)
+    assert run["state"] == "completed"
+    target = "baseline" if run["stop_reason"] == "no_improvement" \
+        else max(run["candidates"], key=lambda c: c["score"])["candidate_id"]
+    client.post(f"/workflow-api/v1/runs/{run['id']}/lock", json={"candidate_id": target})
+    acc = client.post(f"/workflow-api/v1/runs/{run['id']}/accept")
+    assert acc.status_code == 202, acc.text
+    from prompt_lib.db import get_db
+    db = get_db()
+    final = client.get(f"/workflow-api/v1/runs/{run['id']}").json()["budget"]["spent"]
+    for phase in ("search", "acceptance"):
+        expect_n = db.one(
+            "SELECT COALESCE(SUM(actual_in+actual_out),0) AS t FROM ledger"
+            " WHERE run_id=? AND phase=? AND status='ok'", (run["id"], phase))["t"]
+        assert final.get(phase, 0) == expect_n, \
+            f"{phase} 预算状态 {final.get(phase)} != 账本 {expect_n}"

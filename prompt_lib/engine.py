@@ -119,8 +119,13 @@ def generate_once(db: DB, project: dict, prompt_version: dict, item: dict,
 
 
 def evaluate_once(output_text: str, rubric_id: str, model_config: dict, run_id: str = "trial",
-                  phase: str = "search") -> dict:
-    """评价一个输出：返回 {"scores", "abstain", "error"?}。评价失败不静默当0分。"""
+                  phase: str = "search", budget: BudgetState | None = None,
+                  ledger: Ledger | None = None) -> dict:
+    """评价一个输出：返回 {"scores", "abstain", "error"?}。评价失败不静默当0分。
+
+    运行内的评价调用必须传入运行的 budget/ledger（否则每次调用各自记账，
+    会覆盖运行累计用量并绕过预算硬限制）；单独试运行等场景可用默认独立记账。
+    """
     db = get_db()
     rubric = db.one("SELECT * FROM rubrics WHERE id=?", (rubric_id,))
     if rubric is None:
@@ -133,9 +138,11 @@ def evaluate_once(output_text: str, rubric_id: str, model_config: dict, run_id: 
             + dim_lines},
         {"role": "user", "content": f"<output>\n{output_text}\n</output>"},
     ]
-    budget = BudgetState({"mode": "token", "total_limit": 10 ** 9, "search_limit": 10 ** 9,
-                          "acceptance_limit": 10 ** 9})
-    ledger = Ledger(db)
+    if budget is None:
+        budget = BudgetState({"mode": "token", "total_limit": 10 ** 9, "search_limit": 10 ** 9,
+                              "acceptance_limit": 10 ** 9})
+    if ledger is None:
+        ledger = Ledger(db)
     try:
         result = call_model(db, "evaluation", model_config, messages, {}, run_id,
                             new_id("lrq"), phase, budget, ledger)
@@ -329,7 +336,8 @@ def score_prompt(db: DB, project: dict, prompt_version: dict, item_ids: list[str
         entry["output_text"] = out_row["text"]
         ev_model = eval_model.get("evaluation") if isinstance(eval_model, dict) and \
             "evaluation" in eval_model else eval_model
-        scored = evaluate_once(out_row["text"], rubric_id, ev_model, run_id, phase)
+        scored = evaluate_once(out_row["text"], rubric_id, ev_model, run_id, phase,
+                               budget=budget, ledger=ledger)
         if scored.get("abstain"):
             items_detail.append(entry)
             continue

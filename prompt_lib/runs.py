@@ -675,9 +675,11 @@ class AcceptanceService:
                                "acceptance", budget, ledger)
             row_b = self.db.one("SELECT text FROM outputs WHERE id=?", (ob["id"],))
             row_c = self.db.one("SELECT text FROM outputs WHERE id=?", (oc["id"],))
-            sb = evaluate_once(row_b["text"], rubric_id, models["evaluation"], rid, "acceptance") \
+            sb = evaluate_once(row_b["text"], rubric_id, models["evaluation"], rid, "acceptance",
+                               budget=budget, ledger=ledger) \
                 if ob["status"] == "ok" else {"abstain": True}
-            sc = evaluate_once(row_c["text"], rubric_id, models["evaluation"], rid, "acceptance") \
+            sc = evaluate_once(row_c["text"], rubric_id, models["evaluation"], rid, "acceptance",
+                               budget=budget, ledger=ledger) \
                 if oc["status"] == "ok" else {"abstain": True}
             entry = {"item_id": art["item_id"], "base_ok": ob["status"] == "ok",
                      "cand_ok": oc["status"] == "ok",
