@@ -160,3 +160,38 @@ details > summary:hover { color: var(--brand); }
 .next-step-box b { color: var(--warn); }
 #sidebar::-webkit-scrollbar { width: 6px; }
 #sidebar::-webkit-scrollbar-thumb { background: #2c3e60; border-radius: 3px; }
+
+/* ---------- Stitch 设计语言落地（无网络依赖版本） ---------- */
+/* 值主张三列：软彩底卡片 + 头部徽标（源自 Stitch 首页稿） */
+.vp-col { border-radius: var(--radius); padding: 12px 14px; border: 1px solid transparent; }
+.vp-col .vp-head { display: flex; align-items: center; justify-content: space-between;
+  font-weight: 700; margin-bottom: 6px; font-size: 13.5px; }
+.vp-col .vp-badge { font-size: 10.5px; font-weight: 600; padding: 1px 8px; border-radius: 20px; }
+.vp-col.green { background: #f0faf4; border-color: #d3ecdd; }
+.vp-col.green .vp-head { color: var(--ok); }
+.vp-col.green .vp-badge { background: #d9f2e4; color: var(--ok); }
+.vp-col.orange { background: #fffaf0; border-color: #f2e2c4; }
+.vp-col.orange .vp-head { color: var(--warn); }
+.vp-col.orange .vp-badge { background: #f7e8cc; color: var(--warn); }
+.vp-col.blue { background: #f0f6ff; border-color: #d6e4fa; }
+.vp-col.blue .vp-head { color: var(--brand-deep); }
+.vp-col.blue .vp-badge { background: #dbe7fb; color: var(--brand-deep); }
+.vp-col .vp-list li { margin-bottom: 5px; }
+/* 流程高亮链（先测现状 → 自动改写 → 独立验证） */
+.flow-chips { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.flow-chip { background: var(--brand-soft); color: var(--brand-deep); font-weight: 600;
+  padding: 1px 10px; border-radius: 20px; font-size: 12.5px; }
+.flow-chips .arrow { color: var(--faint); }
+/* 五类结论图例（源自 Stitch 报告页稿：帮助用户在发起前理解结论） */
+.legend-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px; margin: 8px 0 2px; }
+.legend-chip { display: flex; gap: 7px; align-items: flex-start; background: #fff;
+  border: 1px solid var(--line); border-radius: var(--radius-s); padding: 6px 9px; font-size: 12px; }
+.legend-chip .dot2 { width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.legend-chip b { font-size: 12px; display: block; }
+.legend-chip small { color: var(--muted); display: block; line-height: 1.5; }
+/* 侧边栏信任说明框（本地计算·隐私零上传） */
+.side-note { margin: 14px 4px 0; background: #1d2c4a; border: 1px solid #2c3e63;
+  border-radius: var(--radius-s); padding: 9px 11px; font-size: 11px; color: #a9b8d4; line-height: 1.6; }
+.side-note b { color: #d7e2f5; display: block; margin-bottom: 2px; }
+.side-note .ok-dot { color: #35c07f; }

@@ -188,20 +188,24 @@ async function pageProjects() {
     <div class="card valueprop">
       <b>这个工具帮你做什么</b>
       <p style="margin:6px 0">你有一段正在用的提示词（比如让 AI 点评学员作业），但输出总在某些地方不满意。
-      把它交给本系统，再给几个真实案例，系统会：<b>先测现状 → 按你确认的标准自动尝试修改 → 用没参与修改的新案例验证是否真的变好</b>。
+      把它交给本系统，再给几个真实案例，系统会：
+      <span class="flow-chips"><span class="flow-chip">先测现状</span><span class="arrow">→</span><span class="flow-chip">按你确认的标准自动改写</span><span class="arrow">→</span><span class="flow-chip">用没参与修改的新案例独立验证</span></span>
       最后你拿走一段改进后的提示词，和一份说明“改了什么、效果如何、证据是什么”的报告。</p>
       <div class="grid3">
-        <div><b>它会</b><ul class="vp-list">
+        <div class="vp-col green"><div class="vp-head"><span>它会</span><span class="vp-badge">自动化支持</span></div>
+          <ul class="vp-list">
           <li>先测出提示词现在的水平</li>
           <li>按<b>你确认的</b>标准自动改写、测试、取舍</li>
           <li>守住底线：原来会的不能变差</li>
           <li>用“考题”独立检验，如实报告结论</li></ul></div>
-        <div><b>它不会</b><ul class="vp-list">
+        <div class="vp-col orange"><div class="vp-head"><span>它不会</span><span class="vp-badge">安全与权责</span></div>
+          <ul class="vp-list">
           <li>不保证一定变好——没提升会如实说“未见提升，保留原版”</li>
           <li>不偷改你的成功标准</li>
           <li>不把参考答案泄露给执行 AI</li>
           <li>不用“背会练习题”冒充真的有效</li></ul></div>
-        <div><b>你要准备</b><ul class="vp-list">
+        <div class="vp-col blue"><div class="vp-head"><span>你要准备</span><span class="vp-badge">课前准备项</span></div>
+          <ul class="vp-list">
           <li>正在用的提示词原文</li>
           <li>几条真实案例（有专家指过问题的最好）</li>
           <li>一句话说明最不满意什么</li></ul></div>
@@ -1118,9 +1122,14 @@ PAGES.verify = async (p) => {
         title="解封考题并做最终对照测试">发起独立验证（解封测试集）</button></div>
     </div>
     <div class="tip"><b>发起后会怎样：</b>考题（封存测试集）解封一次性使用，之后不能再作为独立证明——
-      所以请在确认候选版本满意后再发起。结论只有五种，全部如实呈现：
-      <b>验证有效</b>（改善有证据）/ <b>未见提升</b>（保留原版是正常结果）/ <b>存在退步</b> /
-      <b>证据不足</b>（通常是考题太少，不代表变差）/ <b>评价无效</b>。</div>
+      所以请在确认候选版本满意后再发起。结论只有五种，全部如实呈现：</div>
+    <div class="legend-row">
+      <div class="legend-chip"><span class="dot2" style="background:var(--ok)"></span><span><b>验证有效</b><small>改善有独立证据支持，可采用</small></span></div>
+      <div class="legend-chip"><span class="dot2" style="background:var(--warn)"></span><span><b>未见提升</b><small>保留原版是正常结果</small></span></div>
+      <div class="legend-chip"><span class="dot2" style="background:var(--bad)"></span><span><b>存在退步</b><small>不要采用，回炉重新优化</small></span></div>
+      <div class="legend-chip"><span class="dot2" style="background:var(--faint)"></span><span><b>证据不足</b><small>通常是考题太少，不代表变差</small></span></div>
+      <div class="legend-chip"><span class="dot2" style="background:var(--muted)"></span><span><b>评价无效</b><small>评分过程出错，结论不可信</small></span></div>
+    </div>
     ${done.length ? "" : `<p class="small muted" style="margin-top:4px">还没有可验证的运行：先在「自动优化」里完成一次运行，并在运行详情中锁定待验证版本（或保留原版）。</p>`}
   </div>
   <div class="card">
