@@ -71,26 +71,56 @@ function cleanNote(t) {
     .trim();
 }
 
+/* ---------------- 统一模态框：替代原生 confirm（全站一致的确认体验） ---------------- */
+function uiConfirm(opt) {
+  return new Promise(resolve => {
+    const tone = opt.tone || "ask";
+    const ico = { ask: "?", warn: "!", danger: "!" }[tone];
+    const wrap = document.createElement("div");
+    wrap.className = "modal-overlay";
+    wrap.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="m-title"><span class="m-ico ${tone}">${ico}</span>${esc(opt.title || "请确认")}</div>
+        <div class="m-body">${esc(opt.message || "")}</div>
+        <div class="m-foot">
+          <button class="grey" data-act="cancel">${esc(opt.cancelText || "取消")}</button>
+          <button class="${tone === "danger" ? "danger" : ""}" data-act="ok">${esc(opt.okText || "确定")}</button>
+        </div>
+      </div>`;
+    const done = v => { wrap.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
+    const onKey = e => { if (e.key === "Escape") done(false); };
+    wrap.addEventListener("click", e => {
+      if (e.target === wrap) done(false);
+      const act = e.target.getAttribute && e.target.getAttribute("data-act");
+      if (act === "ok") done(true);
+      if (act === "cancel") done(false);
+    });
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(wrap);
+    wrap.querySelector('[data-act="ok"]').focus();
+  });
+}
+
 /* ---------------- 术语：页面内虚线词悬停即解释 + 名词解释页 ---------------- */
 const GLOSSARY = [
-  ["项目", "长期优化的一件事，比如“学员作答点评”。一个项目可以反复优化多次，材料和规则可以复用。"],
-  ["输入字段", "每次调用 AI 时要提供给它的信息（题目、学员答案…）。提示词里用 {{字段名}} 引用。"],
-  ["评价专用字段", "只给评价用的资料（参考答案、专家批注…）。系统保证它们永远不会发给执行 AI，防止它抄答案。"],
-  ["优化目标", "你现在最不满意的地方、希望改善的方向。自由描述即可，随时可改。"],
-  ["基线", "你当前正在用的提示词版本，是所有比较的起点。"],
-  ["候选", "系统改写出的新版本提示词。只有通过底线检查（原来会的不能变差、严重错误不能增加）才会被保留。"],
-  ["保留 / 淘汰", "每轮改写后系统的取舍决定，都会写出具体依据（提升多少、有没有回退），可追溯。"],
-  ["开发集", "系统反复用来测试和改写的案例，相当于“练习题”。"],
-  ["封存测试集", "修改期间系统接触不到的案例，相当于“考题”；最后用来独立验证，防止只是背会了练习题。"],
-  ["冻结切分", "把案例分组锁定：同一来源的案例不会既当练习题又当考题，保证检验公正。锁定后不可更改。"],
-  ["评价标准", "“怎样算好”的具体规定：检查哪些维度、0-3 分各代表什么。由你确认后发布，修改会产生新版本。"],
-  ["评价器", "按评价标准给输出打分的模型或流程。标准或模型变化后会标记为过期，需重新校准才能批量使用。"],
-  ["专家意见", "人工指出的具体问题（保留原话与期望表现），是优化最直接的依据。"],
-  ["ABCD 评级", "单个案例的改善分级：A 原问题全部解决 / B 部分解决 / C 没解决 / D 出现新问题。可自定义。"],
-  ["原始测评", "优化前先把基线完整测一遍，得到带证据的问题清单，作为改进起点。"],
-  ["独立验证", "用封存测试集做的最终检验。通过才有“验证有效”；没通过或证据不足都会如实显示。"],
-  ["账本与预算", "每次模型调用的用量记录。预算耗尽自动暂停（不占用独立验证的预留额度）；内置模拟供应商不花钱。"],
-  ["演示模式", "内置离线模拟供应商：不用 API Key 就能跑通全部流程，结果为演示性质，不代表真实模型效果。"],
+  ["项目", "针对一个具体业务场景（如“学员作答点评”）建立的长期优化工作区。", "反复优化时，材料、标准和版本都能在同一个项目里积累与复用。"],
+  ["输入字段", "每次调用执行 AI 时要提供给它的信息（题目、学员答案等）。", "提示词里用 {{字段名}} 引用它们，系统按案例逐条替换成真实内容。"],
+  ["评价专用字段", "只给评价用的资料（参考答案、专家批注等）。", "系统保证它们永远不会发给执行 AI，防止它照着参考答案作答。"],
+  ["优化目标", "你现在最不满意的地方、希望改善的方向，自由描述。", "没有明确目标，优化就只能盲目提分，无法针对真正的问题。"],
+  ["基线", "你当前正在使用的提示词版本。", "所有“变好了吗”的比较都以它为起点，改坏了能随时退回。"],
+  ["候选", "系统在优化中改写出的新版本提示词。", "只有通过底线检查（原会的不退步、严重错误不增加）才有资格被保留。"],
+  ["保留 / 淘汰", "每轮改写后系统对候选的取舍决定。", "全部写出具体依据（提升多少、有无回退），可追溯、可复核。"],
+  ["开发集", "系统反复用来测试和改写的案例，相当于“练习题”。", "让系统从真实案例中学习问题模式，而不是凭空想象。"],
+  ["封存测试集", "优化期间系统接触不到的案例，相当于“考题”。", "防止只是把练习题背会了；最后用它检验是否真的变好。"],
+  ["冻结切分", "把案例分组锁定：同一来源不会既当练习题又当考题。", "保证独立检验的公正性；锁定后本批案例不可换组。"],
+  ["评价标准", "“怎样算好”的具体规定：检查维度与 0-3 分锚点。", "由你确认后发布，系统优化期间不会私自更改成功标准。"],
+  ["评价器", "按评价标准给输出打分的模型或流程。", "标准或模型变化后会标记过期，需重新校准才能继续批量使用。"],
+  ["专家意见", "人工指出的具体问题（保留原话与期望表现）。", "这是优化最直接的依据，比笼统的分数更能指明改法。"],
+  ["ABCD 评级", "单个案例的改善分级：A 全解决 / B 部分解决 / C 未解决 / D 出现新问题。", "统一沟通口径，同时展示原问题改善与新增问题两个维度。"],
+  ["原始测评", "优化前把基线在开发集上完整测一遍。", "先摸清现状、拿到带证据的问题清单，优化才有明确靶子。"],
+  ["独立验证", "用封存考题对候选与基线做最终对照测试。", "通过才有“验证有效”；没通过或证据不足都会如实显示。"],
+  ["账本与预算", "每次模型调用的用量与费用记录。", "花费透明可控：预算耗尽自动暂停，验证预留单独保护。"],
+  ["演示模式", "内置离线模拟供应商（无需 API Key）。", "不花一分钱就能跑通全部流程、看懂每一步在做什么。"],
 ];
 function term(k) {
   const d = GLOSSARY.find(g => g[0] === k);
@@ -98,9 +128,15 @@ function term(k) {
 }
 function pageGlossary() {
   setMain(`<h1>名词解释</h1>
-  <p class="sub">每个词两句话：它是什么，为什么需要。页面里的<span class="term" title="像这样：鼠标放上来就能看到解释。">虚线词</span>悬停即可看解释。</p>`
-    + GLOSSARY.map(([k, v]) =>
-      `<div class="card"><b>${esc(k)}</b><div class="small" style="margin-top:4px">${esc(v)}</div></div>`).join(""));
+  <p class="sub">每个词两句话：它是什么，为什么需要。页面里的<span class="term" title="像这样：鼠标放上来就能看到解释。">虚线词</span>悬停即可看解释。</p>
+  <div class="gloss-grid">`
+    + GLOSSARY.map(([k, what, why], idx) => `
+    <div class="card gloss-card">
+      <div class="gloss-no">${String(idx + 1).padStart(2, "0")}</div>
+      <b>${esc(k)}</b>
+      <div class="gloss-block what"><span>【是什么】</span>${esc(what)}</div>
+      <div class="gloss-block why"><span>【为什么需要】</span>${esc(why)}</div>
+    </div>`).join("") + `</div>`);
 }
 
 /* ---------------- 导航 ---------------- */
@@ -366,7 +402,9 @@ async function createProject() {
 function openProject(id) { location.hash = `#/proj/${id}/home`; }
 async function deleteProject(id) {
   const p = (state.projects || []).find(x => x.id === id);
-  if (!confirm(`确定删除项目「${p ? p.name : id}」？\n项目下的案例、运行、报告将一并删除，不可恢复。`)) return;
+  const okDel = await uiConfirm({ title: "删除项目", tone: "danger", okText: "彻底删除",
+    message: `确定删除项目「${p ? p.name : id}」？\n\n项目下的案例、运行、报告将一并删除，不可恢复。` });
+  if (!okDel) return;
   try {
     await api("DELETE", `/projects/${id}`);
     toast("项目已删除");
@@ -404,6 +442,9 @@ function stepBar(progress, pid) {
   }).join(`<span class="arrow">→</span>`) + `</div>`;
 }
 /* 三段式引导：这一步解决什么 / 你要提供什么 / 做完之后（§1.2 每步说明目的与结果） */
+function advIntro(text) {
+  return `<div class="card intro"><div class="intro-row"><span class="intro-k">这一页做什么</span><span>${text}</span></div></div>`;
+}
 function flowIntro(what, provide, then) {
   return `<div class="card intro">
     <div class="intro-row"><span class="intro-k">这一步解决什么</span><span>${what}</span></div>
@@ -572,7 +613,10 @@ async function importCommit() {
     return;
   }
   if (b.errors.length) {
-    if (!confirm(`本批有 ${b.errors.length} 行存在问题，将被跳过（不会静默丢弃，明细见预览）；\n确定只导入 ${b.valid} 条有效行？`)) return;
+    const okPart = await uiConfirm({ title: "部分行存在问题", tone: "warn",
+      okText: `只导入 ${b.valid} 条有效行`,
+      message: `本批有 ${b.errors.length} 行存在问题，将被跳过（不会静默丢弃，明细见预览）。\n确定只导入 ${b.valid} 条有效行？` });
+    if (!okPart) return;
   }
   const r = await api("POST",
     `/projects/${state.pid}/imports/${b.id}/commit`, { exclude_case_ids: [] });
@@ -606,7 +650,9 @@ async function freezeManifest() {
         `· 练习 ${plan.dev.length} 组（${plan.dev.join("、")}）\n` +
         `· 考题 ${plan.sealed.length} 组（${plan.sealed.join("、")}）\n\n` +
         "采用建议并锁定？（也可先到「高级功能 → 案例与数据」手动调整）";
-      if (!confirm(msg)) return;
+      const okGo = await uiConfirm({ title: "锁定案例分组", tone: "ask",
+        okText: "采用建议并锁定", message: msg });
+      if (!okGo) return;
       for (const g of plan.dev) {
         await api("POST", `/projects/${pid}/split`,
           { case_ids: groups[g].map(i => i.id), split: "dev" });
@@ -1158,7 +1204,11 @@ PAGES.verify = async (p) => {
     <b>使用与继续优化</b>
     <p class="muted small">复制文本不等于验证通过；只有结论为“验证有效”的报告才支持正式采用（发布记录会绑定该报告）。
     没有独立考题时会明确标记“尚未独立验证”。最终验证反馈一旦用于继续改写，该批材料不再作为下一轮的独立证明。</p>
-    <a href="#/proj/${p.id}/usage"><button class="grey">发布/回滚/反馈（高级）</button></a>
+  </div>
+  <div class="action-bar">
+    <a href="#/proj/${p.id}/optimize"><button class="grey">← 回到自动优化</button></a>
+    <span class="grow"></span>
+    <a href="#/proj/${p.id}/usage"><button>发布 / 回滚 / 反馈 →</button></a>
   </div>`;
 };
 async function renderReportDetail(repId) {
@@ -1285,23 +1335,26 @@ async function acceptRun() {
 
 /* ---------------- 高级功能：案例与数据 ---------------- */
 PAGES.data = async (p) => {
+  advIntro("这里管理优化用的原始材料：导入案例、按来源分组、把案例分成练习（开发）与考题（封存测试）。改动集合后需重新冻结才会生效。")
   const items = await api("GET", `/projects/${p.id}/items?size=100`);
   const mans = await api("GET", `/projects/${p.id}/manifests`);
   const dsvs = await api("GET", `/projects/${p.id}/dataset_versions`);
+  const splitName = { dev: "开发", select: "选择", sealed_test: "封存测试", unassigned: "未分配" };
+  const splitCls = { dev: "ok", select: "brand", sealed_test: "bad", unassigned: "" };
   const rows = items.items.map(it => `
     <tr>
       <td class="small">${esc(it.case_id)}</td>
       <td class="small">${esc(it.source_group_id)}</td>
-      <td>${pill(it.split === "dev" ? "开发" : it.split === "select" ? "选择" :
-        it.split === "sealed_test" ? "封存测试" : "未分配", it.split === "sealed_test" ? "bad" : "")}</td>
+      <td><span class="pill dot ${splitCls[it.split] || ""}">${esc(splitName[it.split] || it.split)}</span></td>
       <td class="small">${esc(Object.entries(it.runtime_input).map(([k, v]) => `${k}=${v}`).join("｜").slice(0, 80))}</td>
-      <td>
-        <button class="grey" onclick="setSplit('${it.id}','dev')">开发</button>
-        <button class="grey" onclick="setSplit('${it.id}','select')">选择</button>
-        <button class="grey" onclick="setSplit('${it.id}','sealed_test')">封存</button>
+      <td class="nowrap-actions">
+        ${["dev", "select", "sealed_test"].map(sp =>
+          `<button class="grey ${it.split === sp ? "current" : ""}"
+            onclick="setSplit('${it.id}','${sp}')">${splitName[sp]}</button>`).join("")}
       </td>
     </tr>`).join("");
   return `
+  ${advIntro("这里管理优化用的原始材料：导入案例、按来源分组、把案例分成练习（开发）与考题（封存测试）。改动集合后需重新冻结才会生效。")}
   <div class="card">
     <b>导入案例（JSONL / CSV）</b>
     <p class="muted small">预览校验会逐行指出问题，不会悄悄丢弃任何一行；同一批内容重复提交不会产生重复案例。</p>
@@ -1324,6 +1377,18 @@ PAGES.data = async (p) => {
   </div>
   <div class="card">
     <b>分组切分冻结</b>
+    ${(() => {
+      const cnt = { dev: 0, select: 0, sealed_test: 0, unassigned: 0 };
+      for (const it of items.items) cnt[it.split] = (cnt[it.split] || 0) + 1;
+      const total = items.items.length || 1;
+      const seg = [["dev", "开发集", "var(--ok)"], ["select", "选择集", "var(--brand)"],
+        ["sealed_test", "封存考题", "var(--bad)"], ["unassigned", "未分配", "var(--faint)"]];
+      return `<div class="ratio-line">当前配比：` + seg.map(([k, label, color]) =>
+        cnt[k] ? `<span class="ratio-item"><i style="background:${color}"></i>${label}
+          ${Math.round(cnt[k] / total * 100)}%（${cnt[k]}条）</span>` : "").join("") + `</div>`;
+    })()}
+    <p class="muted small" style="margin-top:6px">严谨性保障：冻结后集合标识将固化并写入数据快照，
+    防止优化过程中产生数据泄漏与过拟合；考题仅在最終验收时使用。</p>
     <button onclick="freezeManifest()">冻结切分清单</button>
     <div class="small muted">已有清单：${mans.manifests.map(m =>
       `${esc(m.id)}（种子${m.seed}，${esc(m.state)}）`).join("；") || "暂无"}</div>
@@ -1338,6 +1403,7 @@ async function setSplit(itemId, split) {
 
 /* ---------------- 高级功能：评价标准 ---------------- */
 PAGES.rubric = async (p) => {
+  advIntro("这里定义“怎样算好”。已发布版本不可修改，改动会生成新版本；标准变化会使已校准的评价器过期。")
   const rs = await api("GET", `/projects/${p.id}/rubrics`);
   const rows = rs.rubrics.map(r => `
     <tr><td>v${r.version_no}</td><td>${pill(r.status, r.status === "published" ? "ok" : "warn")}</td>
@@ -1346,6 +1412,7 @@ PAGES.rubric = async (p) => {
     <td>${r.status === "draft" ? `<button onclick="publishRubric('${r.id}')">发布</button>` : ""}
     <button class="grey" onclick='editRubric(${JSON.stringify(JSON.stringify(r.schema))})'>载入为新草稿</button></td></tr>`).join("");
   return `
+  ${advIntro("这里定义“怎样算好”。已发布版本不可修改，改动会生成新版本；标准变化会使已校准的评价器过期。")}
   <div class="card"><b>评价标准</b>
     <p class="muted small">每个维度都要写全 0—3 分的含义（锚点）才能发布；标准一旦发布不可覆盖，修改会产生新版本，并使已校准的评价器过期。</p>
     <table><tr><th>版本</th><th>状态</th><th>维度</th><th>哈希</th><th>操作</th></tr>${rows}</table>
@@ -1394,10 +1461,12 @@ async function publishRubric(rid) {
 
 /* ---------------- 高级功能：人工标注 ---------------- */
 PAGES.annotation = async (p) => {
+  advIntro("这里做人工盲评：两份输出匿名对比，支持判“相当 / 都不可用 / 无法判断”，用于校准评价或复核争议。")
   const outs = await api("GET", `/projects/${p.id}/outputs?limit=200`);
   const opts = outs.outputs.map(o =>
     `<option value="${o.id}">${o.id.slice(0, 14)}…（运行 ${esc((o.run_id || "").slice(0, 14))}，状态 ${esc(o.status)}）</option>`).join("");
   return `
+  ${advIntro("这里做人工盲评：两份输出匿名对比，支持判“相当 / 都不可用 / 无法判断”，用于校准评价或复核争议。")}
   <div class="card"><b>创建匿名 A/B 对比</b>
     <p class="muted small">盲评视图不返回版本ID、名称、时间或评分，避免先入为主；除选择优胜方外，也可以判“相当 / 两边都不可用 / 无法判断”。</p>
     <div class="flex">
@@ -1453,6 +1522,7 @@ async function revealPair(pid) {
 
 /* ---------------- 高级功能：评价器校准 ---------------- */
 PAGES.judge = async (p) => {
+  advIntro("评价器按已发布的标准自动打分。校准用于检验它与人工判断的一致程度；构建与审计必须使用不同来源的案例。")
   const [rs, js, conns] = await Promise.all([
     api("GET", `/projects/${p.id}/rubrics`), api("GET", `/projects/${p.id}/judges`),
     api("GET", "/settings/connections")]);
@@ -1465,6 +1535,7 @@ PAGES.judge = async (p) => {
     <td class="small">构建 ${j.build_refs.length} / 审计 ${j.audit_refs.length}</td>
     <td class="small">${j.metrics && j.metrics.audit ? `审计n=${j.metrics.audit.n}` : "未校准"}</td></tr>`).join("");
   return `
+  ${advIntro("评价器按已发布的标准自动打分。校准用于检验它与人工判断的一致程度；构建与审计必须使用不同来源的案例。")}
   <div class="card"><b>创建评价器</b>
     <div class="flex">
       <div><label>评价标准（已发布）</label><select id="jdg-rubric">${rubOpts}</select></div>
@@ -1506,6 +1577,7 @@ async function calibrateJudge() {
 
 /* ---------------- 高级功能：提示词库 ---------------- */
 PAGES.prompts = async (p) => {
+  advIntro("所有提示词版本都在这里：人工版本与优化候选并存，随时复制、对比或手动新建；运行与发布永远引用明确版本。")
   const ps = await api("GET", `/projects/${p.id}/prompts`);
   const rel = await api("GET", `/projects/${p.id}/releases`);
   const rows = ps.prompts.map(v => `
@@ -1519,6 +1591,7 @@ PAGES.prompts = async (p) => {
     <td class="small" style="white-space:normal">${esc(v.hypothesis || "")}</td></tr>`).join("");
   const runtimeFields = p.contract.runtime_fields.map(f => f.name).join("、");
   return `
+  ${advIntro("所有提示词版本都在这里：人工版本与优化候选并存，随时复制、对比或手动新建；运行与发布永远引用明确版本。")}
   <div class="card"><b>提示词版本库</b>
     <p class="muted small">运行时白名单变量：${esc(runtimeFields)}。每次运行都引用明确版本，不会受后续修改影响；新增版本不会改变“当前使用”的版本。</p>
     <table><tr><th>名称</th><th>版本</th><th>来源</th><th>变量</th><th>长度</th><th>哈希</th><th>指针</th><th>假设</th></tr>${rows}</table>
@@ -1549,6 +1622,7 @@ async function createPromptAdv() {
 
 /* ---------------- 高级功能：试运行 ---------------- */
 PAGES.playground = async (p) => {
+  advIntro("单条试运行：选一个版本和一条案例立刻执行，用于快速检查格式与效果；每次调用都计入账本。")
   const [ps, items] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/items?size=100`)]);
   const pvOpts = ps.prompts.map(v =>
@@ -1556,6 +1630,7 @@ PAGES.playground = async (p) => {
   const itOpts = items.items.map(i =>
     `<option value="${i.id}">${esc(i.case_id)}</option>`).join("");
   return `
+  ${advIntro("单条试运行：选一个版本和一条案例立刻执行，用于快速检查格式与效果；每次调用都计入账本。")}
   <div class="card"><b>试运行（单条真实请求，全部计量）</b>
     <div class="flex">
       <div><label>提示词版本</label><select id="tr-pv">${pvOpts}</select></div>
@@ -1592,6 +1667,7 @@ async function diffPrompt() {
 
 /* ---------------- 高级功能：实验配置 ---------------- */
 PAGES.experiment = async (p) => {
+  advIntro("高级启动入口：完整配置快照、分阶段预算与批量模式。常规使用建议走左侧五步流程。")
   const [ps, mans, rs, js, conns] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/manifests`),
     api("GET", `/projects/${p.id}/rubrics`), api("GET", `/projects/${p.id}/judges`),
@@ -1608,6 +1684,7 @@ PAGES.experiment = async (p) => {
   const devIds = devItems.items.map(i => i.id), selIds = selItems.items.map(i => i.id);
   window._devIds = devIds; window._selIds = selIds;
   return `
+  ${advIntro("高级启动入口：完整配置快照、分阶段预算与批量模式。常规使用建议走左侧五步流程。")}
   <div class="card"><b>实验配置与启动（高级）</b>
     <p class="muted small">启动时会保存全部版本的快照（之后改配置不影响进行中的运行）；搜索与独立验证的预算分开记账；没有核实过价格时只能按 token 数设上限；同一键重复点击只会创建一次运行。</p>
     <div class="grid2">
@@ -1684,6 +1761,7 @@ async function startRunAdv() {
 
 /* ---------------- 高级功能：验收报告 ---------------- */
 PAGES.acceptance = async (p) => {
+  advIntro("独立验收的原始入口；常规使用建议走第五步「验证与使用」，那里有更完整的报告解读。")
   const [runs, reps] = await Promise.all([
     api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/reports`)]);
   const done = runs.runs.filter(r => r.state === "completed");
@@ -1693,6 +1771,7 @@ PAGES.acceptance = async (p) => {
     <td>${(r.stats.diff * 100).toFixed(1)}pp</td>
     <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td></tr>`).join("");
   return `
+  ${advIntro("独立验收的原始入口；常规使用建议走第五步「验证与使用」，那里有更完整的报告解读。")}
   <div class="card"><b>发起独立验收</b>
     <p class="muted small">必须先在运行详情里锁定候选；解封后考题一次性消耗。</p>
     <div class="flex"><div><label>已完成的运行</label><select id="acc-run">${runOpts}</select></div>
@@ -1706,6 +1785,7 @@ PAGES.acceptance = async (p) => {
 
 /* ---------------- 高级功能：使用与反馈 ---------------- */
 PAGES.usage = async (p) => {
+  advIntro("发布与回滚记录：正式采用必须绑定“验证有效”的报告；这里保留全部历史，回滚不删除任何记录。")
   const [rel, reps, ps, fb] = await Promise.all([
     api("GET", `/projects/${p.id}/releases`), api("GET", `/projects/${p.id}/reports`),
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/feedback`)]);
@@ -1720,6 +1800,7 @@ PAGES.usage = async (p) => {
     <tr><td class="small">${esc({direct:"直接采用",minor_edit:"轻微修改",major_edit:"实质修改",abandoned:"放弃"}[f.adoption] || f.adoption)}</td><td class="small">${esc(f.reason)}</td>
     <td class="small">${esc(f.status)}</td><td class="small">${esc(fmtTime(f.created_at))}</td></tr>`).join("");
   return `
+  ${advIntro("发布与回滚记录：正式采用必须绑定“验证有效”的报告；这里保留全部历史，回滚不删除任何记录。")}
   <div class="card"><b>当前使用版本</b>
     ${rel.current ? `<div class="kv">
       <div>发布ID</div><div class="small">${esc(rel.current.id)}</div>
@@ -1803,7 +1884,8 @@ async function settingsHtml() {
   </div>`;
 }
 async function pageSettingsGlobal() {
-  setMain(await settingsHtml());
+  setMain(`<h1>模型设置</h1>
+    <p class="sub">连接真实模型或使用内置演示供应商；密钥与价格只保存在本机。</p>` + await settingsHtml());
 }
 PAGES.settings = async (p) => settingsHtml();
 async function addConn() {
