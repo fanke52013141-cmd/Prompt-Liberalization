@@ -23,11 +23,14 @@ python scripts/stitch_client.py call list_projects '{}'
   - 浅色模式，品牌蓝 `#2456D6`，成功 `#178A4C`，警示 `#B25E09`，中性底 `#F4F6FA`
   - 字体：PLUS_JAKARTA_SANS（标题）/ IBM_PLEX_SANS（正文），圆角 ROUND_EIGHT
   - 设计规范（designMd）：中文优先、卡片骨架、左侧深蓝导航、五步流程胶囊、统计小卡、提示块；禁止暴露内部编号与英文状态码
-- 已生成页面：
+- 已生成页面（覆盖五步流程全部主页面）：
   - `项目列表首页`（screen `461f9ad8…`）：三列软彩底清单（它会/它不会/你要准备）、流程高亮链、隐私信任框
   - `验证与使用·独立验证结果报告`（screen `967ca5c3…`）：五类结论图例卡、怎么看这份报告条、建议下一步条、区块化统计
+  - `准备材料`（screen `d8a49afc…`）：卡片标题蓝竖条、底部操作条+就绪度进度
+  - `确认怎么评`（screen `50b2c6ba…`）：表单分组与专家意见表格布局
+  - `运行详情`（screen `7b52f390…`）：顶部三统计卡（基线分/待验证版本/账本用量）、候选裁定胶囊
 
-本地参考副本：`data/stitch_home.html`、`data/stitch_verify.html`（data/ 目录不入库，可用 `get_screen` 重新下载）。
+本地参考副本：`data/stitch_*.html`（data/ 目录不入库，可用 `get_screen` 重新下载）。
 
 ## 已落地到本仓库的设计元素
 
@@ -38,6 +41,9 @@ python scripts/stitch_client.py call list_projects '{}'
 | 五类结论图例卡 | 验证页 `.legend-row/.legend-chip`（中文结论+通俗解释） |
 | 侧边栏「本地计算·隐私零上传」信任框 | `index.html` `.side-note` |
 | 怎么看这份报告 / 建议下一步 | 报告页 `.tip` / `.next-step-box`（v1.1 已有，v1.2 保留） |
+| 卡片标题蓝色竖条 | 全局 `.card > b:first-child::before` |
+| 运行详情顶部三统计卡（含未锁定橙色提醒） | `.stat-hero` + `.stat.attention` |
+| 材料页底部吸底操作条 + 就绪度 4 项进度 | `.action-bar` + `.ready-bar`（目标/提示词/案例/分组） |
 
 注意：生成稿里的 Material Symbols 图标字体未采用——本地应用必须完全离线可用，图标一律不用外部字体。
 

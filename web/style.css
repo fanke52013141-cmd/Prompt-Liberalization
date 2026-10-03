@@ -195,3 +195,32 @@ details > summary:hover { color: var(--brand); }
   border-radius: var(--radius-s); padding: 9px 11px; font-size: 11px; color: #a9b8d4; line-height: 1.6; }
 .side-note b { color: #d7e2f5; display: block; margin-bottom: 2px; }
 .side-note .ok-dot { color: #35c07f; }
+
+/* ---------- Stitch 运行详情/材料页稿落地 ---------- */
+/* 卡片标题统一蓝色竖条（三张设计稿共用语言） */
+.card > b:first-child { display: inline-flex; align-items: center; gap: 8px; }
+.card > b:first-child::before { content: ""; width: 4px; height: 14px; border-radius: 2px;
+  background: var(--brand); display: inline-block; }
+/* 运行详情顶部三统计卡 */
+.stat-hero { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 10px; margin: 10px 0; }
+@media (max-width: 900px) { .stat-hero { grid-template-columns: 1fr; } }
+.stat-hero .stat { padding: 12px 14px; }
+.stat-hero .stat .v { font-size: 20px; }
+.stat-hero .stat .sub2 { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.stat.attention { background: #fffaf0; border-color: #ecd9a8; }
+.stat.attention .v { color: var(--warn); font-size: 15px; }
+.stat .head-pill { float: right; font-size: 10.5px; padding: 1px 8px; border-radius: 20px;
+  background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.stat .head-pill.ok { background: var(--ok-soft); color: var(--ok); }
+/* 底部操作条（材料/评价页：返回 · 就绪度 · 下一步） */
+.action-bar { position: sticky; bottom: 0; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: 0 -1px 8px rgba(29,37,48,.07);
+  display: flex; align-items: center; gap: 12px; padding: 11px 16px; margin-top: 16px; z-index: 5; }
+.action-bar .grow { flex: 1; }
+.action-bar .ready { font-size: 12.5px; color: var(--ink-2); display: inline-flex;
+  align-items: center; gap: 7px; }
+.ready-bar { width: 120px; height: 6px; border-radius: 3px; background: #eef1f6; overflow: hidden;
+  display: inline-block; vertical-align: middle; }
+.ready-bar > i { display: block; height: 100%; background: var(--ok); border-radius: 3px; }
+/* 候选表：数值窄列不断行 */
+.cand-table td:nth-child(3), .cand-table td:nth-child(4), .cand-table td:nth-child(5) { white-space: nowrap; }

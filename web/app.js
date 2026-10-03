@@ -523,10 +523,18 @@ PAGES.materials = async (p) => {
     <span class="muted small">没有手动分配过也不用担心：点锁定时系统会给出“练习 / 考题”的自动划分建议，确认后生效。
     想自己控制划分，可到「高级功能 → 案例与数据」逐条指定。</span>
   </div>
-  <div style="margin-top:6px">
-    <a href="#/projects"><button class="grey">保存并返回</button></a>
-    <a href="#/proj/${p.id}/evaluate"><button>下一步：确认怎么评 →</button></a>
-  </div>`;
+  ${(() => {
+    const ready = [!!p.contract.goal, ps.prompts.length > 0, items.total > 0,
+      !!prog.steps.find(x => x.key === "prepare").done];
+    const n = ready.filter(Boolean).length;
+    return `<div class="action-bar">
+      <a href="#/projects"><button class="grey">← 保存并返回</button></a>
+      <span class="ready"><span class="ready-bar"><i style="width:${Math.round(n / 4 * 100)}%"></i></span>
+        材料就绪度 ${n}/4（目标${ready[0] ? "✓" : "○"} 提示词${ready[1] ? "✓" : "○"} 案例${ready[2] ? "✓" : "○"} 分组锁定${ready[3] ? "✓" : "○"}）</span>
+      <span class="grow"></span>
+      <a href="#/proj/${p.id}/evaluate"><button>下一步：确认怎么评 →</button></a>
+    </div>`;
+  })()}`;
 };
 async function saveGoal() {
   await api("PUT", `/projects/${state.pid}/goal`, { goal: document.getElementById("mat-goal").value });
@@ -1000,7 +1008,7 @@ async function pageRunDetail(rid) {
         <div style="flex:1"><b>第 ${rd.round_no} 轮</b>
           ${pill(rd.status === "scored" ? "已测评" : rd.status === "rewrite_failed" ? "改写失败" : "无修改",
             rd.status === "scored" ? "ok" : "warn")}</div>
-        <div class="small muted">${esc(rd.created_at)}</div>
+        <div class="small muted">${esc(fmtTime(rd.created_at))}</div>
       </div>
       ${rd.hypothesis ? `<div class="small"><b>修改假设：</b>${esc(rd.hypothesis)}</div>` : ""}
       ${rd.rationale ? `<div class="small ${rd.status === "rewrite_failed" ? "" : "muted"}"><b>保留决定：</b>${esc(rd.rationale)}</div>` : ""}
@@ -1026,11 +1034,19 @@ async function pageRunDetail(rid) {
     <button onclick="resumeRun('${r.id}')">恢复运行</button></div>` : ""}
   <div class="card">
     <b>基线与候选对比（不只比较平均分）</b>
-    <div class="kv"><div>基线平均分</div><div>${r.baseline_score != null && !(live && !Number(r.baseline_score))
-      ? Number(r.baseline_score).toFixed(3) : (live ? "测评中…（完成后显示）" : "-")}</div>
-    <div>待验证版本</div><div class="small">${r.locked_candidate ? esc(r.locked_candidate) + "（已锁定，可去「验证与使用」做最终检验）" : canLock ? "未锁定：在下方选择保留一个候选，或保留原版" : "未锁定"}</div>
-    <div>账本用量</div><div class="small">${fmtLedger(r.budget)}</div></div>
-    ${(r.candidates || []).length ? `<table style="margin-top:8px"><tr><th>候选</th><th>决定</th><th>平均分</th><th>可用率</th><th>底线检查</th><th>长度</th><th>依据</th><th></th></tr>${candRows}</table>`
+    <div class="stat-hero">
+      <div class="stat"><div class="k">基线平均分</div>
+        <div class="v">${r.baseline_score != null && !(live && !Number(r.baseline_score))
+          ? Number(r.baseline_score).toFixed(3) : (live ? "测评中…" : "-")}</div>
+        <div class="sub2">${live ? "完成后作为所有候选的比较起点" : "所有候选都与它比较"}</div></div>
+      <div class="stat ${r.locked_candidate ? "" : "attention"}"><div class="k">待验证版本
+        <span class="head-pill ${r.locked_candidate ? "ok" : ""}">${r.locked_candidate ? "已锁定" : "未锁定"}</span></div>
+        <div class="v">${r.locked_candidate ? esc(r.locked_candidate) : canLock ? "尚未选择" : "未锁定"}</div>
+        <div class="sub2">${r.locked_candidate ? "可去「验证与使用」做最终检验" : canLock ? "在下方锁定一个候选，或保留原版" : "完成运行后可锁定"}</div></div>
+      <div class="stat"><div class="k">账本用量 <span class="head-pill ok">本地计费</span></div>
+        <div class="v small" style="font-size:13px;white-space:normal">${fmtLedger(r.budget)}</div></div>
+    </div>
+    ${(r.candidates || []).length ? `<table class="cand-table" style="margin-top:8px"><tr><th>候选</th><th>决定</th><th>平均分</th><th>可用率</th><th>底线检查</th><th>长度</th><th>依据</th><th></th></tr>${candRows}</table>`
       : `<p class="muted small">尚无候选${r.state === "completed" ? "：本轮没有产生值得保留的修改，保留基线为合法结果。" : ""}。</p>`}
     <div style="margin-top:8px">
       ${canLock ? `<button class="grey" onclick="lockCand('${r.id}','baseline')">不采用候选，保留原版</button>` : ""}
