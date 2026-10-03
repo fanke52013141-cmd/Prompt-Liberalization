@@ -42,6 +42,15 @@ def create_app(web_dir: str) -> FastAPI:
             "retryable": False, "correlation_id": _cid()})
 
     reg = _routes(app)
+
+    @app.middleware("http")
+    async def no_cache_static(request: Request, call_next):
+        """界面静态资源走协商缓存：本地更新后刷新页面即可用到新版本，不会被旧缓存卡住。"""
+        response = await call_next(request)
+        if request.url.path in ("/", "/index.html", "/app.js", "/style.css"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
     return app
 

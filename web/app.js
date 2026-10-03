@@ -44,6 +44,32 @@ function errText(e) {
     ? "\n" + Object.entries(e.body.field_errors).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
   return e.message + fe;
 }
+/* 统一显示：本地时间 / 中文来源 / 中文任务名（避免内部标识直接暴露给用户） */
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function originLabel(o) {
+  return { manual: "人工", optimizer: "优化候选", trial: "试用" }[o] || (o === "人工" ? o : "人工");
+}
+const TASK_LABELS = {
+  student_feedback: "学员作答点评", question_explain: "题目解析",
+  article_title: "公众号标题", article_framework: "文章框架",
+};
+function taskLabel(p) {
+  return (p.contract && p.contract.label) || TASK_LABELS[p.task_type] || p.task_type;
+}
+function cleanNote(t) {
+  // 后端 note 里的内部规范编号（§9.2 / TC043 等）对用户没有意义，统一隐藏
+  return String(t == null ? "" : t)
+    .replace(/（?\s*§[^）]*）?/g, "")
+    .replace(/（?\s*TC\d+[^）]*）?/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
 
 /* ---------------- 术语：页面内虚线词悬停即解释 + 名词解释页 ---------------- */
 const GLOSSARY = [
@@ -137,10 +163,10 @@ async function pageProjects() {
     <div class="card">
       <div class="flex">
         <div style="flex:2">
-          <b>${esc(p.name)}</b> ${pill(esc(p.contract.label || p.task_type), "brand")}
+          <b>${esc(p.name)}</b> ${pill(esc(taskLabel(p)), "brand")}
           ${p.name.startsWith("示例：") ? pill("演示", "warn") : ""}
           ${p.status === "archived" ? pill("已归档", "warn") : pill("使用中", "ok")}
-          <div class="muted small">${esc(p.description || "")} · 创建于 ${esc(p.created_at)}</div>
+          <div class="muted small">${esc([p.description, "创建于 " + fmtTime(p.created_at)].filter(Boolean).join(" · "))}</div>
           ${step}
         </div>
         <div style="flex:0">
@@ -148,7 +174,8 @@ async function pageProjects() {
           ${p.status === "archived"
             ? `<button class="grey" onclick="unarchive('${p.id}')">取消归档</button>`
             : `<button class="grey" onclick="archive('${p.id}')">归档</button>`}
-          <button class="danger" onclick="deleteProject('${p.id}')">删除</button>
+          <button class="danger-text" title="彻底删除该项目及其全部数据，不可恢复"
+            onclick="deleteProject('${p.id}')">删除</button>
         </div>
       </div>
     </div>`);
@@ -402,7 +429,7 @@ PAGES.home = async (p) => {
     <div class="small">${esc(materials)}</div>
     <div style="margin-top:12px"><a href="#/proj/${p.id}/${page}"><button>${esc(cur.action)} →</button></a>
     ${cur.key === "optimize" ? `<a href="#/proj/${p.id}/runs"><button class="grey">查看优化进度</button></a>` : ""}
-    ${cur.key === "verify" && prog.steps[4].done ? `<a href="#/proj/${p.id}/verify"><button class="grey">查看结果报告</button></a>` : ""}</div>
+    ${cur.key === "verify" && prog.steps[4].done && cur.action !== "查看结果报告" ? `<a href="#/proj/${p.id}/verify"><button class="grey">查看结果报告</button></a>` : ""}</div>
   </div>
   <div class="card">
     <b>辅助入口</b>
@@ -487,9 +514,10 @@ PAGES.materials = async (p) => {
   <div class="card">
     <b>锁定案例分组（用于最后的独立检验）</b>
     <p class="muted small">系统会把案例分成“练习题”（${term("开发集")}）和“考题”（${term("封存测试集")}）并${term("冻结切分")}：
-    考题在优化期间系统碰不到，最后用来检验改好的提示词是不是真有效。点下面按钮即锁定，锁定后本批案例不能换组。</p>
+    考题在优化期间系统碰不到，最后用来检验改好的提示词是不是真有效。锁定后本批案例不能换组。</p>
     <button class="grey" onclick="freezeManifest()">锁定案例分组（冻结切分）</button>
-    <span class="muted small">材料还没齐？没关系，可以先保存草稿继续编辑，之后再来锁定。</span>
+    <span class="muted small">没有手动分配过也不用担心：点锁定时系统会给出“练习 / 考题”的自动划分建议，确认后生效。
+    想自己控制划分，可到「高级功能 → 案例与数据」逐条指定。</span>
   </div>
   <div style="margin-top:6px">
     <a href="#/projects"><button class="grey">保存并返回</button></a>
@@ -525,16 +553,64 @@ async function importPreview() {
     b.valid > 0 ? pill(`预览成功：有效 ${b.valid} 条，可提交`, "ok") : pill("无有效行", "bad");
 }
 async function importCommit() {
-  if (!window._lastBatch) { toast("请先预览校验", true); return; }
+  const b = window._lastBatch;
+  if (!b) { toast("请先点击“预览校验”，确认无误后再提交", true); return; }
+  if (b.valid === 0) {
+    toast("没有可导入的有效行：请看下方预览里逐行标出的问题（常见原因：字段名与项目定义的输入字段不一致），修正后重新预览", true);
+    return;
+  }
+  if (b.errors.length) {
+    if (!confirm(`本批有 ${b.errors.length} 行存在问题，将被跳过（不会静默丢弃，明细见预览）；\n确定只导入 ${b.valid} 条有效行？`)) return;
+  }
   const r = await api("POST",
-    `/projects/${state.pid}/imports/${window._lastBatch.id}/commit`, { exclude_case_ids: [] });
-  toast(`导入完成：本批有效 ${r.valid} 条（重复提交幂等返回同一批次）`);
+    `/projects/${state.pid}/imports/${b.id}/commit`, { exclude_case_ids: [] });
+  toast(`导入完成：本批有效 ${r.valid} 条已进入案例库`);
   route();
 }
 async function freezeManifest() {
   try {
-    const r = await api("POST", `/projects/${state.pid}/manifests/freeze`, { seed: 20260927 });
-    toast(`已锁定：练习案例按分组冻结，考题 ${r.sealed_test_items} 条已封存（优化期间系统接触不到）`);
+    const pid = state.pid;
+    const listing = await api("GET", `/projects/${pid}/items?size=200`);
+    const items = listing.items || [];
+    if (!items.length) { toast("请先导入至少 2 条案例，再锁定分组（每条案例默认各自成组）", true); return; }
+    // 按来源分组；未分配的组给出“练习/考题”自动划分建议，经确认后写入
+    const groups = {};
+    for (const it of items) (groups[it.source_group_id] = groups[it.source_group_id] || []).push(it);
+    const gids = Object.keys(groups).sort();
+    const unassigned = gids.filter(g => groups[g].some(i => i.split === "unassigned"));
+    if (gids.length < 2) {
+      toast(`目前只有 ${gids.length} 个来源分组。考题（封存测试）至少需要 1 个与练习案例不同的来源，` +
+        "请再导入至少 1 条案例后再锁定。", true);
+      return;
+    }
+    let plan = null;
+    if (unassigned.length) {
+      const nSeal = Math.max(1, Math.floor(unassigned.length / 3));
+      plan = { dev: unassigned.slice(0, unassigned.length - nSeal), sealed: unassigned.slice(unassigned.length - nSeal) };
+      const msg = "锁定前需要把案例分成两组角色：\n\n" +
+        "· 练习案例（开发集）：优化过程中反复使用；\n" +
+        "· 考题（封存测试集）：优化期间系统接触不到，最后用来独立验证。\n\n" +
+        `检测到 ${unassigned.length} 个来源分组未分配。建议自动划分：\n` +
+        `· 练习 ${plan.dev.length} 组（${plan.dev.join("、")}）\n` +
+        `· 考题 ${plan.sealed.length} 组（${plan.sealed.join("、")}）\n\n` +
+        "采用建议并锁定？（也可先到「高级功能 → 案例与数据」手动调整）";
+      if (!confirm(msg)) return;
+      for (const g of plan.dev) {
+        await api("POST", `/projects/${pid}/split`,
+          { case_ids: groups[g].map(i => i.id), split: "dev" });
+      }
+      for (const g of plan.sealed) {
+        await api("POST", `/projects/${pid}/split`,
+          { case_ids: groups[g].map(i => i.id), split: "sealed_test" });
+      }
+    }
+    const r = await api("POST", `/projects/${pid}/manifests/freeze`, { seed: 20260927 });
+    if (!r.sealed_test_items) {
+      toast("已锁定，但没有案例被划为考题——最后的独立验证将无法进行。" +
+        "建议在「案例与数据」把部分组改为封存测试后重新确认。", true);
+    } else {
+      toast(`已锁定：练习案例按分组冻结，考题 ${r.sealed_test_items} 条已封存（优化期间系统接触不到）`);
+    }
     route();
   } catch (e) { toast(errText(e), true); }
 }
@@ -716,9 +792,17 @@ function isBaselineRun(r) {
 }
 PAGES.baseline = async (p) => {
   const prog = await getProgress(p.id);
-  const runs = await api("GET", `/projects/${p.id}/runs`);
+  const [runs, ps, rs] = await Promise.all([
+    api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/prompts`),
+    api("GET", `/projects/${p.id}/rubrics`)]);
   const baselineRuns = runs.runs.filter(r => isBaselineRun(r));
   const latest = baselineRuns.find(r => r.state === "completed");
+  const pvOpts = ps.prompts.map(v =>
+    `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(originLabel(v.origin))}）</option>`).join("") ||
+    "<option value=\"\">（尚未创建提示词——请回第一步准备材料）</option>";
+  const rubOpts = rs.rubrics.filter(r => r.status === "published")
+    .map(r => `<option value="${r.id}">v${r.version_no}（已发布）</option>`).join("") ||
+    "<option value=\"\">（尚未发布评价标准——请回第二步确认怎么评）</option>";
   let problemsHtml = "";
   if (latest) {
     const probs = [];
@@ -742,9 +826,10 @@ PAGES.baseline = async (p) => {
     <b>为什么做原始测评</b>
     <p class="muted small">建立优化起点，确认系统发现的问题确实是你要解决的问题。导入的历史输出只有来源与配置满足比较要求时才能用于正式前后对照；否则用于诊断，必要时重新生成可比输出。</p>
     <div class="flex">
-      <div><label>基线提示词版本</label><select id="bl-prompt"></select></div>
-      <div><label>评价标准（已发布）</label><select id="bl-rubric"></select></div>
-      <div style="flex:0"><label> </label><button onclick="startBaselineRun()">运行原始测评</button></div>
+      <div><label>基线提示词版本</label><select id="bl-prompt">${pvOpts}</select></div>
+      <div><label>评价标准（已发布）</label><select id="bl-rubric">${rubOpts}</select></div>
+      <div style="flex:0"><label> </label><button onclick="startBaselineRun()"
+        title="把当前提示词在开发案例上完整测一遍">运行原始测评</button></div>
     </div>
   </div>
   <div class="card">
@@ -807,7 +892,7 @@ PAGES.optimize = async (p) => {
     api("GET", `/projects/${p.id}/prompts`),
     api("GET", `/projects/${p.id}/rubrics`)]);
   const pubRub = rs.rubrics.filter(r => r.status === "published");
-  const pvOpts = ps.prompts.map(v => `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(v.origin)}）</option>`).join("");
+  const pvOpts = ps.prompts.map(v => `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(originLabel(v.origin))}）</option>`).join("");
   const rubOpts = pubRub.map(r => `<option value="${r.id}">v${r.version_no}（已发布）</option>`).join("");
   return `
   ${stepBar(prog, p.id)}
@@ -830,8 +915,8 @@ PAGES.optimize = async (p) => {
         <option value="1">每轮等待人工评价</option></select></div>
     </div>
     <div style="margin-top:10px"><button onclick="startOptimizeRun()">启动自动优化</button>
-    <span class="muted small">预算：token 总额 200 万（搜索 120 万 + 独立验收预留 60 万，验收预留单独保护 TC033）。
-    高级预算与批量模式见 <a class="small" href="#/proj/${p.id}/experiment">实验配置</a>。</span></div>
+    <span class="muted small">内置演示供应商不花钱；预算已设上限：token 总额 200 万（搜索 120 万 + 独立验证预留 60 万，
+    验证预留单独保护，不会被优化用掉）。接入真实模型或调整预算见 <a class="small" href="#/proj/${p.id}/experiment">实验配置</a>。</span></div>
   </div>
   ${await renderRunList(p)}`;
 };
@@ -867,7 +952,7 @@ async function renderRunList(p) {
     <td>${kind}</td><td>${pill(runStateLabel(r.state), r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}</td>
     <td class="small">${esc(runStopLabel(r.stop_reason))}</td>
     <td class="small">${kept} 保留 / ${(r.candidates || []).length} 候选</td>
-    <td class="small">${esc(r.created_at)}</td></tr>`;
+    <td class="small">${esc(fmtTime(r.created_at))}</td></tr>`;
   }).join("");
   return `<div class="card"><b>历次优化</b>
     <p class="muted small">离开页面不取消运行；每次运行有独立地址，刷新后仍是对应运行（§12）。</p>
@@ -881,9 +966,17 @@ PAGES.runs = async (p) => renderRunList(p);
 
 /* ---------------- 运行详情（独立可恢复路由 §8.4/§12） ---------------- */
 let _pollTimer = null;
+let _stateTimer = null;
+function fmtLedger(b) {
+  const s = (b.spent || {}), r = (b.reserved || {});
+  const sum = o => Object.values(o).reduce((a, x) => a + (Number(x) || 0), 0);
+  return `已用 ${sum(s).toLocaleString()}（搜索 ${Number(s.search || 0).toLocaleString()} + 验收 ${Number(s.acceptance || 0).toLocaleString()}）· ` +
+    `在途预留 ${sum(r).toLocaleString()}（额度内预估，完成后结算）`;
+}
 async function pageRunDetail(rid) {
-  clearInterval(_pollTimer);
+  clearInterval(_pollTimer); clearInterval(_stateTimer);
   const [r] = await Promise.all([api("GET", `/runs/${rid}`)]);
+  const live = ["running", "waiting_human", "paused_budget", "stopping", "queued"].includes(r.state);
   const kept = (r.candidates || []).filter(c => c.decision === "kept");
   const canLock = r.state === "completed" && !r.locked_candidate;
   const candRows = (r.candidates || []).map(c => `
@@ -919,20 +1012,22 @@ async function pageRunDetail(rid) {
     ${isBaselineRun(r) ? "原始测评" : "自动优化"} · 阶段 ${esc(r.stage || "-")}</p></div>
     <div style="flex:0"><a class="small" href="#/proj/${state.pid}/optimize">← 返回运行列表</a></div></div>
   ${r.state === "running" ? `<div class="card"><p class="muted small">正在优化：第 ${r.round_no + 1} 轮。
-    正在检查：原问题是否减少；其他判断是否退步；评分是否仍符合标准。未完成全部轮数前不显示完成百分比。</p></div>` : ""}
+    正在检查：原问题是否减少；其他判断是否退步；评分是否仍符合标准。未完成全部轮数前不显示完成百分比。
+    <b>运行结束后本页会自动刷新，无需手动操作。</b></p></div>` : ""}
   ${r.state === "waiting_human" ? `<div class="card focus"><b>等待人工参与</b>
     <p class="muted small">本轮已完成，等待指定评价。离开页面不影响运行；确认评价后点击继续。</p>
     <button onclick="continueRun('${r.id}')">继续优化 →</button></div>` : ""}
   ${r.state === "paused_budget" ? `<div class="card"><b>预算暂停</b>
-    <p class="muted small">搜索预算耗尽；独立验收预留未被占用（TC033）。已完成输出全部保留。</p>
+    <p class="muted small">搜索预算已用完；独立验证的预留额度没有被占用。已完成的输出全部保留，可调整预算后恢复运行。</p>
     <button onclick="resumeRun('${r.id}')">恢复运行</button></div>` : ""}
   <div class="card">
     <b>基线与候选对比（不只比较平均分）</b>
-    <div class="kv"><div>基线平均分</div><div>${r.baseline_score != null ? Number(r.baseline_score).toFixed(3) : "-"}</div>
+    <div class="kv"><div>基线平均分</div><div>${r.baseline_score != null && !(live && !Number(r.baseline_score))
+      ? Number(r.baseline_score).toFixed(3) : (live ? "测评中…（完成后显示）" : "-")}</div>
     <div>待验证版本</div><div class="small">${r.locked_candidate ? esc(r.locked_candidate) + "（已锁定，可去「验证与使用」做最终检验）" : canLock ? "未锁定：在下方选择保留一个候选，或保留原版" : "未锁定"}</div>
-    <div>账本用量</div><div class="small">已用 ${esc(JSON.stringify(r.budget.spent || {}))} / 在途 ${esc(JSON.stringify(r.budget.reserved || {}))}</div></div>
+    <div>账本用量</div><div class="small">${fmtLedger(r.budget)}</div></div>
     ${(r.candidates || []).length ? `<table style="margin-top:8px"><tr><th>候选</th><th>决定</th><th>平均分</th><th>可用率</th><th>底线检查</th><th>长度</th><th>依据</th><th></th></tr>${candRows}</table>`
-      : `<p class="muted small">尚无候选${r.state === "completed" ? "：本轮没有产生值得保留的修改，保留基线为合法结果（TC037）" : ""}。</p>`}
+      : `<p class="muted small">尚无候选${r.state === "completed" ? "：本轮没有产生值得保留的修改，保留基线为合法结果。" : ""}。</p>`}
     <div style="margin-top:8px">
       ${canLock ? `<button class="grey" onclick="lockCand('${r.id}','baseline')">不采用候选，保留原版</button>` : ""}
       ${r.locked_candidate && r.locked_candidate !== "baseline" ? `<a href="#/proj/${state.pid}/verify"><button>去验证与使用 →</button></a>` : ""}
@@ -945,6 +1040,19 @@ async function pageRunDetail(rid) {
   ${roundCards || ""}`);
   pollEvents(rid, 0);
   if (r.state === "running") _pollTimer = setInterval(() => pollEvents(rid, window._evCursor || 0), 2500);
+  if (live) {
+    // 运行态下轮询运行本身：状态一变（完成/失败/暂停/等待人工）立即整页刷新，避免用户面对滞后页面
+    let lastState = r.state;
+    _stateTimer = setInterval(async () => {
+      try {
+        const cur = await api("GET", `/runs/${rid}`);
+        if (cur.state !== lastState) {
+          clearInterval(_stateTimer); clearInterval(_pollTimer);
+          pageRunDetail(rid);
+        }
+      } catch (e) { /* 静默重试 */ }
+    }, 2500);
+  }
 }
 async function pollEvents(rid, cursor) {
   try {
@@ -992,8 +1100,8 @@ PAGES.verify = async (p) => {
   const repRows = reps.reports.map(r => `
     <tr><td class="small">${esc(r.id)}</td><td>${decisionPill(r.decision)}</td>
     <td>${(r.stats.diff * 100).toFixed(1)}pp</td>
-    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td>
-    <td class="small">${esc(r.created_at)}</td></tr>`).join("");
+    <td class="small">考题 ${r.stats.group_n} 组（未知 ${r.stats.unknown}）</td>
+    <td class="small">${esc(fmtTime(r.created_at))}</td></tr>`).join("");
   return `
   ${stepBar(prog, p.id)}
   ${flowIntro("最终检验：用优化期间系统碰不到的“考题”（" + "封存测试集）测试，防止只是背会了练习题。",
@@ -1006,9 +1114,13 @@ PAGES.verify = async (p) => {
     ${reps.reports.length ? "" : pill("尚未独立验证", "warn")}</p>
     <div class="flex">
       <div><label>已完成并锁定候选的运行</label><select id="acc-run">${runOpts}</select></div>
-      <div style="flex:0"><label> </label><button onclick="acceptRun()">发起独立验证（解封测试集）</button></div>
+      <div style="flex:0"><label> </label><button onclick="acceptRun()"
+        title="解封考题并做最终对照测试">发起独立验证（解封测试集）</button></div>
     </div>
-    <p class="muted small">解封一次性消耗封存测试集（TC043）；结论只有五类：verified_improvement / no_improvement / regression / inconclusive / evaluation_invalid。</p>
+    <div class="tip"><b>发起后会怎样：</b>考题（封存测试集）解封一次性使用，之后不能再作为独立证明——
+      所以请在确认候选版本满意后再发起。结论只有五种，全部如实呈现：
+      <b>验证有效</b>（改善有证据）/ <b>未见提升</b>（保留原版是正常结果）/ <b>存在退步</b> /
+      <b>证据不足</b>（通常是考题太少，不代表变差）/ <b>评价无效</b>。</div>
     ${done.length ? "" : `<p class="small muted" style="margin-top:4px">还没有可验证的运行：先在「自动优化」里完成一次运行，并在运行详情中锁定待验证版本（或保留原版）。</p>`}
   </div>
   <div class="card">
@@ -1019,8 +1131,8 @@ PAGES.verify = async (p) => {
   ${reps.reports.length ? await renderReportDetail(reps.reports[0].id) : ""}
   <div class="card">
     <b>使用与继续优化</b>
-    <p class="muted small">复制文本不等于验证通过；正式采用必须绑定 verified 报告（TC048）。
-    没有独立样例时明确标记“尚未独立验证”。最终验证反馈一旦用于继续改写，该批材料不再作为下一轮的独立证明。</p>
+    <p class="muted small">复制文本不等于验证通过；只有结论为“验证有效”的报告才支持正式采用（发布记录会绑定该报告）。
+    没有独立考题时会明确标记“尚未独立验证”。最终验证反馈一旦用于继续改写，该批材料不再作为下一轮的独立证明。</p>
     <a href="#/proj/${p.id}/usage"><button class="grey">发布/回滚/反馈（高级）</button></a>
   </div>`;
 };
@@ -1029,50 +1141,91 @@ async function renderReportDetail(repId) {
   const s = r.stats;
   const psStats = s.problem_stats || {};
   const es = s.evidence_scope || {};
+  const abcd = psStats.abcd || {};
+  // 通俗解读：先给一句话结论与建议，再给细节
+  const nextAdvice = {
+    verified_improvement: `改善有独立证据支持，可以采用候选版本投入实际使用（见第 6 节复制）。
+      注意“验证有效”基于本批考题范围；换人群或换题型时建议再验证。`,
+    no_improvement: `没有发现可靠改善——这是正常结果，保留原版即可。候选版本仍保留在「提示词版本」中，
+      想继续尝试可回第三/四步补充专家意见后再次优化。`,
+    regression: `候选版本存在退步，不要采用。建议回第四步查看淘汰候选的依据，或补充专家意见后重新优化。`,
+    inconclusive: `证据不足通常是因为考题（封存测试集）太少——本批考题已被这次验证消耗，不能再作为独立证明。
+      建议：准备更多考题案例（不同来源、覆盖真实场景），优化出新候选后再次独立验证。`,
+    evaluation_invalid: `评价过程本身出了问题（如评分失败过多），结论不可信。请检查评价标准与模型设置后重试。`,
+  }[r.decision] || "";
+  const nextBox = nextAdvice ? `<div class="next-step-box"><b>建议下一步：</b>${nextAdvice}</div>` : "";
   let promptBlock = "";
   try {
     const cand = await api("GET", `/prompts/${r.candidate_ref}`);
     const base = await api("GET", `/prompts/${r.baseline_ref}`);
     promptBlock = `
     <div class="grid2">
-      <div><b>原始版（v${base.version_no}，${base.length} 字）</b><div class="out-text small">${esc(base.body)}</div></div>
-      <div><b>候选版（v${cand.version_no}，${cand.length} 字）</b><div class="out-text small">${esc(cand.body)}</div></div>
+      <div><b>原始版（v${base.version_no}，${base.length || String(base.body).length} 字）</b><div class="out-text small">${esc(base.body)}</div></div>
+      <div><b>候选版（v${cand.version_no}，${cand.length || String(cand.body).length} 字）</b><div class="out-text small">${esc(cand.body)}</div></div>
     </div>
     <button class="grey" onclick="copyPrompt('${r.candidate_ref}')">复制候选提示词</button>
     <button class="grey" onclick="exportReport('${r.id}')">导出报告（JSON）</button>
-    <span class="muted small">复制文本不等于验证通过（§9.4）</span>`;
+    <span class="muted small">复制文本≠验证通过：只有结论为“验证有效”时才建议正式采用。</span>`;
   } catch (e) { promptBlock = `<p class="muted small">（提示词明细不可用）</p>`; }
-  const abcd = psStats.abcd || {};
+  const stat = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   return `
   <div class="card">
     <b>结果报告 ${esc(r.id)}</b> ${decisionPill(r.decision)}
-    <h2>1. 结论</h2>
-    <div>${decisionPill(r.decision)} 主指标：${esc(s.primary_metric || "-")}；
-    基线可用率 ${(s.baseline_usable_rate * 100).toFixed(1)}% → 候选 ${(s.candidate_usable_rate * 100).toFixed(1)}%，
-    差异 ${(s.diff * 100).toFixed(1)}pp</div>
-    <h2>2. 专家原问题的解决情况</h2>
-    <div class="small">${psStats.total_registered ? `
-      问题项 n=${psStats.total_registered}（案例 ${psStats.rated_cases} 个）：
+    <div class="tip" style="margin-top:8px"><b>怎么看这份报告：</b>
+      先看第 1 节的结论和建议；第 2、3 节回答“你最关心的问题解决了吗、有没有改出新问题”；
+      第 4 节是独立考题上的对照数据；第 6 节可直接复制新提示词。统计术语可悬停查看，也可查「名词解释」。</div>
+    ${nextBox}
+    <div class="report-section"><h2>1. 结论</h2>
+      <div class="stat-grid">
+        ${stat("结论", decisionPill(r.decision))}
+        ${stat("原始版可用率", (s.baseline_usable_rate * 100).toFixed(1) + "%")}
+        ${stat("候选版可用率", (s.candidate_usable_rate * 100).toFixed(1) + "%")}
+        ${stat("差异", (s.diff >= 0 ? "+" : "") + (s.diff * 100).toFixed(1) + "pp")}
+      </div>
+      <div class="small muted">主指标：${esc(s.primary_metric || "-")}（“可用”指按你确认的评价标准达到可直接使用的水平）</div>
+    </div>
+    <div class="report-section"><h2>2. 专家原问题的解决情况</h2>
+      <div class="small">${psStats.total_registered ? `
+      问题项 ${psStats.total_registered} 个（涉及案例 ${psStats.rated_cases} 个）：
       完全解决 ${psStats.resolution.resolved}、部分解决 ${psStats.resolution.partial}、
       未解决 ${psStats.resolution.unresolved}、无法判断 ${psStats.resolution.unknown}${psStats.resolution.already_ok ? `、基线已正常 ${psStats.resolution.already_ok}` : ""}
-      <div class="muted">问题项数量与案例数量分开统计，不混用（§9.3）。</div>` : esc(psStats.note || "无登记问题")}</div>
-    <h2>3. 新增问题与原有能力退步</h2>
-    <div class="small">严重错误：基线 ${s.severe_baseline} → 候选 ${s.severe_candidate}
-      ${s.severe_upper_bound_95 != null ? `；候选零严重错误观察的单侧95%上界 ${(s.severe_upper_bound_95 * 100).toFixed(2)}%（不等于真实零风险）` : ""}<br>
-      ABCD 分布：A ${abcd.A ?? 0} / B ${abcd.B ?? 0} / C ${abcd.C ?? 0} / D ${abcd.D ?? 0} /
-      无法判断 ${abcd.cannot_judge ?? 0} / 未登记 ${abcd.not_rated ?? 0}
-      <div class="muted">${esc(psStats.note || "")}</div></div>
-    <h2>4. 独立验证结果</h2>
-    <div class="small">修复 ${s.fix} / 退步 ${s.regress} / 双可用 ${s.both} / 双不可用 ${s.neither}；来源 n=${s.group_n}；
-      精确McNemar双侧 p=${s.mcnemar_p != null ? Number(s.mcnemar_p).toFixed(6) : "-"}；
-      bootstrap 95%CI=[${(s.bootstrap.ci_low * 100).toFixed(1)}pp, ${(s.bootstrap.ci_high * 100).toFixed(1)}pp]；
-      缺失界限 ${(s.missing_bounds.low * 100).toFixed(1)}%–${(s.missing_bounds.high * 100).toFixed(1)}%（未知 ${s.missing_bounds.unknown_n} 条不删除）</div>
-    <h2>5. 证据范围与统计口径</h2>
-    <div class="small">${esc(es.optimization_sample?.role || "")}（n=${es.optimization_sample?.n ?? "-"}）；
-      ${esc(es.independent?.role || "")}（n=${es.independent?.n ?? "-"}，已消耗）
-      <div class="muted">${esc(es.note || "")}</div></div>
-    <h2>6. 完整提示词与使用</h2>
-    ${promptBlock}
+      <div class="muted">问题按“条”与案例按“个”分开统计，不混用。</div>`
+      : esc(cleanNote(psStats.note) || "本项目未登记专家原问题，按通用评价标准评判；可回第二步补充专家意见获得针对性结论。")}</div>
+    </div>
+    <div class="report-section"><h2>3. 新增问题与原有能力退步</h2>
+      <div class="stat-grid">
+        ${stat("严重错误（原始版）", s.severe_baseline)}
+        ${stat("严重错误（候选版）", s.severe_candidate)}
+        ${s.severe_upper_bound_95 != null ? stat("候选零严重错误观察", `<small>95%置信上界 ${(s.severe_upper_bound_95 * 100).toFixed(2)}%</small>`) : ""}
+      </div>
+      <div class="small muted">ABCD 评级分布：A 完全解决 ${abcd.A ?? 0} / B 部分解决 ${abcd.B ?? 0} / C 未解决 ${abcd.C ?? 0} / D 出现新问题 ${abcd.D ?? 0} /
+      无法判断 ${abcd.cannot_judge ?? 0} / 未登记 ${abcd.not_rated ?? 0}。
+      ${s.severe_upper_bound_95 != null ? "“零严重错误观察”不等于真实零风险，上界才是可靠表述。" : ""}</div>
+    </div>
+    <div class="report-section"><h2>4. 独立验证结果（考题上的对照）</h2>
+      <div class="stat-grid">
+        ${stat("考题组数", s.group_n)}
+        ${stat("仅候选可用（修复）", s.fix)}
+        ${stat("仅原始版可用（退步）", s.regress)}
+        ${stat("两者都可用", s.both)}
+        ${stat("两者都不可用", s.neither)}
+      </div>
+      <details class="small"><summary>统计明细（供核对，可折叠）</summary>
+        <div class="small muted">精确 McNemar 双侧 p = ${s.mcnemar_p != null ? Number(s.mcnemar_p).toFixed(6) : "-"}；
+        配对 bootstrap 95% 区间 [${(s.bootstrap.ci_low * 100).toFixed(1)}pp, ${(s.bootstrap.ci_high * 100).toFixed(1)}pp]；
+        缺失界限 ${(s.missing_bounds.low * 100).toFixed(1)}%–${(s.missing_bounds.high * 100).toFixed(1)}%
+        （未知 ${s.missing_bounds.unknown_n} 条未删除，计入区间）。
+        区间不跨 0 且观察提升达到门槛时才判“验证有效”。</div>
+      </details>
+    </div>
+    <div class="report-section"><h2>5. 证据范围与统计口径</h2>
+      <div class="small">${esc(es.optimization_sample?.role || "")}（${es.optimization_sample?.n ?? "-"} 条，不构成独立证明）；
+      独立验证（未参与修改的案例）${es.independent?.n ?? "-"} 条，已消耗。
+      <div class="muted">${esc(cleanNote(es.note))}</div></div>
+    </div>
+    <div class="report-section"><h2>6. 完整提示词与使用</h2>
+      ${promptBlock}
+    </div>
   </div>`;
 }
 async function copyPrompt(pvid) {
@@ -1126,7 +1279,7 @@ PAGES.data = async (p) => {
   return `
   <div class="card">
     <b>导入案例（JSONL / CSV）</b>
-    <p class="muted small">预览校验逐行报错，不静默丢行；提交携带预览哈希，重复提交幂等（TC006/TC007）。</p>
+    <p class="muted small">预览校验会逐行指出问题，不会悄悄丢弃任何一行；同一批内容重复提交不会产生重复案例。</p>
     <div class="flex">
       <div style="flex:0 0 140px"><label>格式</label>
         <select id="imp-fmt"><option value="jsonl">JSONL</option><option value="csv">CSV（runtime:前缀）</option></select></div>
@@ -1150,7 +1303,7 @@ PAGES.data = async (p) => {
     <div class="small muted">已有清单：${mans.manifests.map(m =>
       `${esc(m.id)}（种子${m.seed}，${esc(m.state)}）`).join("；") || "暂无"}</div>
     <div class="small muted">数据版本：${dsvs.versions.map(v =>
-      `v${v.version_no} ${esc(v.id.slice(0, 12))}`).join("，") || "暂无"}</div>
+      `v${v.version_no}`).join("，") || "暂无"}（每次导入/冻结都会形成可追溯的版本）</div>
   </div>`;
 };
 async function setSplit(itemId, split) {
@@ -1169,7 +1322,7 @@ PAGES.rubric = async (p) => {
     <button class="grey" onclick='editRubric(${JSON.stringify(JSON.stringify(r.schema))})'>载入为新草稿</button></td></tr>`).join("");
   return `
   <div class="card"><b>评价标准</b>
-    <p class="muted small">维度锚点 0-3 齐全才能发布（TC012）；标准变化会使评价器进入 stale（TC024）。</p>
+    <p class="muted small">每个维度都要写全 0—3 分的含义（锚点）才能发布；标准一旦发布不可覆盖，修改会产生新版本，并使已校准的评价器过期。</p>
     <table><tr><th>版本</th><th>状态</th><th>维度</th><th>哈希</th><th>操作</th></tr>${rows}</table>
   </div>
   <div class="card">
@@ -1221,7 +1374,7 @@ PAGES.annotation = async (p) => {
     `<option value="${o.id}">${o.id.slice(0, 14)}…（运行 ${esc((o.run_id || "").slice(0, 14))}，状态 ${esc(o.status)}）</option>`).join("");
   return `
   <div class="card"><b>创建匿名 A/B 对比</b>
-    <p class="muted small">盲评视图不返回版本ID、名称、时间或评分（TC018）；偏好支持 tie / both_unusable / unknown（TC019）。</p>
+    <p class="muted small">盲评视图不返回版本ID、名称、时间或评分，避免先入为主；除选择优胜方外，也可以判“相当 / 两边都不可用 / 无法判断”。</p>
     <div class="flex">
       <div><label>左侧输出</label><select id="pair-left">${opts}</select></div>
       <div><label>右侧输出</label><select id="pair-right">${opts}</select></div>
@@ -1294,7 +1447,7 @@ PAGES.judge = async (p) => {
       <div style="flex:0"><button onclick="createJudge()">创建</button></div>
     </div>
   </div>
-  <div class="card"><b>校准（构建集/审计集必须来源隔离 TC021）</b>
+  <div class="card"><b>校准（构建集与审计集必须来自不同来源）</b>
     <label>构建集输出ID（每行一个，需人工核验gold）</label><textarea id="jdg-build" placeholder="out_..."></textarea>
     <label>审计集输出ID（独立来源，每行一个）</label><textarea id="jdg-audit"></textarea>
     <div style="margin-top:8px"><button onclick="calibrateJudge()">运行校准</button></div>
@@ -1342,7 +1495,7 @@ PAGES.prompts = async (p) => {
   const runtimeFields = p.contract.runtime_fields.map(f => f.name).join("、");
   return `
   <div class="card"><b>提示词版本库</b>
-    <p class="muted small">运行时白名单变量：${esc(runtimeFields)}。实验引用明确版本ID（TC031）；新增版本不改变当前使用指针（TC025）。</p>
+    <p class="muted small">运行时白名单变量：${esc(runtimeFields)}。每次运行都引用明确版本，不会受后续修改影响；新增版本不会改变“当前使用”的版本。</p>
     <table><tr><th>名称</th><th>版本</th><th>来源</th><th>变量</th><th>长度</th><th>哈希</th><th>指针</th><th>假设</th></tr>${rows}</table>
   </div>
   <div class="card"><b>新建版本</b>
@@ -1374,7 +1527,7 @@ PAGES.playground = async (p) => {
   const [ps, items] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/items?size=100`)]);
   const pvOpts = ps.prompts.map(v =>
-    `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(v.origin)}）</option>`).join("");
+    `<option value="${v.id}">${esc(v.name)} v${v.version_no}（${esc(originLabel(v.origin))}）</option>`).join("");
   const itOpts = items.items.map(i =>
     `<option value="${i.id}">${esc(i.case_id)}</option>`).join("");
   return `
@@ -1431,7 +1584,7 @@ PAGES.experiment = async (p) => {
   window._devIds = devIds; window._selIds = selIds;
   return `
   <div class="card"><b>实验配置与启动（高级）</b>
-    <p class="muted small">配置快照固定全部版本；搜索与验收预算分列（TC033）；价格未知时只能用 token 上限模式（TC032）；双击幂等（TC035）。</p>
+    <p class="muted small">启动时会保存全部版本的快照（之后改配置不影响进行中的运行）；搜索与独立验证的预算分开记账；没有核实过价格时只能按 token 数设上限；同一键重复点击只会创建一次运行。</p>
     <div class="grid2">
       <div><label>基线提示词版本</label><select id="ex-pv">${pvOpts}</select></div>
       <div><label>切分清单</label><select id="ex-man">${manOpts}</select></div>
@@ -1516,7 +1669,7 @@ PAGES.acceptance = async (p) => {
     <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td></tr>`).join("");
   return `
   <div class="card"><b>发起独立验收</b>
-    <p class="muted small">必须先锁定候选（TC042）；解封消耗封存测试集（TC043）。</p>
+    <p class="muted small">必须先在运行详情里锁定候选；解封后考题一次性消耗。</p>
     <div class="flex"><div><label>已完成的运行</label><select id="acc-run">${runOpts}</select></div>
     <div style="flex:0"><button onclick="acceptRun()">解封并验收</button></div></div>
   </div>
@@ -1537,10 +1690,10 @@ PAGES.usage = async (p) => {
   const hist = rel.history.map(h => `
     <tr><td class="small">${esc(h.id)}</td><td class="small">${esc(h.prompt_version_id)}</td>
     <td>${pill(h.status, h.status === "active" ? "ok" : h.status === "trial" ? "warn" : "")}</td>
-    <td class="small">${esc(h.created_at)}</td></tr>`).join("");
+    <td class="small">${esc(fmtTime(h.created_at))}</td></tr>`).join("");
   const fbRows = fb.feedback.map(f => `
-    <tr><td class="small">${esc(f.adoption)}</td><td class="small">${esc(f.reason)}</td>
-    <td class="small">${esc(f.status)}</td><td class="small">${esc(f.created_at)}</td></tr>`).join("");
+    <tr><td class="small">${esc({direct:"直接采用",minor_edit:"轻微修改",major_edit:"实质修改",abandoned:"放弃"}[f.adoption] || f.adoption)}</td><td class="small">${esc(f.reason)}</td>
+    <td class="small">${esc(f.status)}</td><td class="small">${esc(fmtTime(f.created_at))}</td></tr>`).join("");
   return `
   <div class="card"><b>当前使用版本</b>
     ${rel.current ? `<div class="kv">
@@ -1552,7 +1705,7 @@ PAGES.usage = async (p) => {
   <div class="card"><b>发布</b>
     <div class="flex">
       <div><label>提示词版本</label><select id="rel-pv">${pvOpts}</select></div>
-      <div><label>验收报告（active 必须绑定 verified 报告 TC048）</label><select id="rel-rep">${repOpts}</select></div>
+      <div><label>验收报告（正式采用必须绑定“验证有效”的报告）</label><select id="rel-rep">${repOpts}</select></div>
       <div style="flex:0"><label> </label>
         <button onclick="release('active')">正式采用</button>
         <button class="ghost" onclick="release('trial')">另存试用（不改指针）</button></div>
@@ -1570,7 +1723,7 @@ PAGES.usage = async (p) => {
       <div><label>原因</label><input id="fb-reason"></div>
       <div style="flex:0"><label> </label><button onclick="sendFeedback()">提交反馈</button></div>
     </div>
-    <p class="muted small">反馈回流进待核验池，不自动成为测试gold（TC050）。</p>
+    <p class="muted small">使用反馈会进入待核验池，经人工确认后才可能成为新的练习案例，不会自动当作标准答案。</p>
     <table><tr><th>采用</th><th>原因</th><th>状态</th><th>时间</th></tr>${fbRows}</table>
   </div>`;
 };
@@ -1605,7 +1758,7 @@ async function settingsHtml() {
     <td><button class="grey" onclick="testConn('${c.id}')">测试</button></td></tr>`).join("");
   return `
   <div class="card"><b>模型连接（未创建项目时也可进入）</b>
-    <p class="muted small">密钥只保存在本机数据库（TC051）。内置模拟供应商可离线跑通全部流程（演示模式）；
+    <p class="muted small">密钥只保存在本机数据库，界面只显示“已配置”，导出与日志不含密钥。内置模拟供应商可离线跑通全部流程（演示模式，不花钱）；
     真实使用请添加 OpenAI 兼容连接（智谱/DeepSeek/OpenAI等）。</p>
     <table><tr><th>ID</th><th>名称</th><th>类型</th><th>模型</th><th>密钥</th><th></th></tr>${rows}</table>
     <div class="grid2" style="margin-top:10px">
@@ -1618,7 +1771,7 @@ async function settingsHtml() {
       <div style="flex:0;align-self:end"><button onclick="addConn()">保存连接</button></div>
     </div>
   </div>
-  <div class="card"><b>价格表（金额硬预算需要全部角色已核实单价 TC032）</b>
+  <div class="card"><b>价格表（按金额设预算上限时，需要每个在用模型都有已核实的单价）</b>
     <label>JSON：{"模型名": {"in_per_1k": 0.001, "out_per_1k": 0.002, "currency": "CNY"}}</label>
     <textarea id="price-json">${esc(JSON.stringify(prices.prices, null, 2))}</textarea>
     <div style="margin-top:8px"><button onclick="savePrices()">保存价格表</button></div>
