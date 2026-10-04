@@ -130,6 +130,63 @@ def _routes(app: FastAPI):
     def readiness(pid: str):
         return ProjectsService().readiness(pid)
 
+    @app.get(API + "/projects/{pid}/outbound-preview")
+    def outbound_preview(pid: str):
+        """数据外发范围预览（07 方案 R15/TC078）：各角色收到的字段一目了然。"""
+        contract = ProjectsService().get(pid)["contract"]
+        runtime = [f.get("label") or f.get("name") for f in contract.get("runtime_fields", [])]
+        evalf = [f.get("label") or f.get("name") for f in contract.get("evaluation_fields", [])]
+        return {
+            "roles": [
+                {"role": "生成（执行 AI）", "receives": runtime,
+                 "note": "只收到输入字段的案例内容"},
+                {"role": "评价器", "receives": ["模型输出正文", "评价标准维度"] + evalf,
+                 "note": "评价专用字段（如参考答案）只给评价器，用于判断输出质量"},
+                {"role": "优化器（反思）",
+                 "receives": ["失败案例的输入与输出摘录", "已验证问题与简短理由"],
+                 "note": "只使用开发/选择侧证据；接触不到封存考题"},
+            ],
+            "never_sent": ["评价专用字段绝不进入生成请求（防止抄答案）",
+                           "封存考题原文在解封前不出站",
+                           "API 密钥不出现在任何请求与日志"],
+        }
+
+    @app.get(API + "/reports/{rep_id}/package")
+    def report_package(rep_id: str):
+        """导出使用包（07 方案 R13/§19.1/TC076）：文本+manifest，不含密钥与封存原文。"""
+        rep = AcceptanceService().get(rep_id)
+        cand = PromptService().get(rep["candidate_ref"])
+        base = PromptService().get(rep["baseline_ref"])
+        proj = ProjectsService().get(rep["project_id"])
+        rel = ReleaseService()
+        cur = rel.current(rep["project_id"])
+        if cur and cur["prompt_version_id"] == cand["id"]:
+            status = "正式采用（active）"
+        else:
+            trials = [h for h in rel.history(rep["project_id"])
+                      if h["prompt_version_id"] == cand["id"] and h["status"] == "trial"]
+            status = "试用（未验证指针）" if trials else "未采用（仅验证记录）"
+        return {
+            "package_version": "1.0",
+            "generated_at": rep["created_at"],
+            "task": {"name": proj["name"], "type": proj["task_type"],
+                     "evaluation_unit": proj["contract"].get("evaluation_unit"),
+                     "runtime_fields": proj["contract"].get("runtime_fields")},
+            "prompt": {"name": cand["name"], "version_no": cand["version_no"],
+                       "body": cand["body"], "variables": cand["variables"],
+                       "hash": cand["hash"]},
+            "baseline": {"name": base["name"], "version_no": base["version_no"],
+                         "hash": base["hash"]},
+            "verification": {"report_id": rep["id"], "decision": rep["decision"],
+                             "eligibility": rep.get("eligibility", ""),
+                             "diff": rep["stats"].get("diff"),
+                             "group_n": rep["stats"].get("group_n"),
+                             "scope_note": "验证仅针对已记录配置与考题来源范围；"
+                                           "更换模型或删改提示词后应重新比较"},
+            "adoption_status": status,
+            "note": "本使用包不含密钥、封存原文或评价专用资料",
+        }
+
     # ---------------- 数据 P03
     class ImportIn(BaseModel):
         source_name: str = "粘贴导入"
@@ -231,9 +288,13 @@ def _routes(app: FastAPI):
     @app.get(API + "/projects/{pid}/manifests")
     def manifests(pid: str):
         rows = get_db().query("SELECT * FROM split_manifests WHERE project_id=?", (pid,))
+        sealed_n = get_db().one(
+            "SELECT COUNT(*) AS c FROM sealed_artifacts WHERE project_id=? AND access_state='sealed'",
+            (pid,))["c"]
         return {"manifests": [{"id": r["id"], "dataset_version_id": r["dataset_version_id"],
                                "group_map_hash": r["group_map_hash"], "seed": r["seed"],
-                               "state": r["state"], "created_at": r["created_at"]} for r in rows]}
+                               "state": r["state"], "created_at": r["created_at"]} for r in rows],
+                "sealed_count": sealed_n}
 
     @app.get(API + "/projects/{pid}/dataset_versions")
     def dsvs(pid: str):
@@ -401,7 +462,7 @@ def _routes(app: FastAPI):
     @app.post(API + "/projects/{pid}/runs/validate")
     def run_validate(pid: str, draft: dict):
         snap = RunService().validate_snapshot(pid, draft)
-        return {"valid": True, "snapshot": snap, "estimate": RunService().estimate(draft)}
+        return {"valid": True, "snapshot": snap, "estimate": RunService().estimate(draft, pid)}
 
     @app.post(API + "/projects/{pid}/runs", status_code=202)
     def run_create(pid: str, draft: dict, request: Request):

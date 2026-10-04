@@ -204,7 +204,88 @@ class ProjectsService:
             state = "judge_ready"
         else:
             state = "experiment_ready"
-        return {"state": state, "checks": checks}
+
+        # ---- 07 方案 R01/R05/§12：按动作计算资格（替代单一线性准备度） ----
+        # 每个动作独立判断：可做 / 需补齐（原因+修复入口）；种子输出不要求评价器（R01/TC061）
+        outputs_n = self.db.one("SELECT COUNT(*) AS c FROM outputs WHERE project_id=?", (pid,))["c"]
+        locked_run = self.db.one(
+            "SELECT id FROM runs WHERE project_id=? AND locked_candidate!='' AND locked_candidate"
+            " IS NOT NULL ORDER BY created_at DESC LIMIT 1", (pid,))
+        verified = self.db.one(
+            "SELECT id,decision FROM acceptance_reports WHERE project_id=?"
+            " ORDER BY created_at DESC LIMIT 1", (pid,))
+        sealed_n = self.db.one(
+            "SELECT COUNT(*) AS c FROM sealed_artifacts WHERE project_id=?"
+            " AND access_state='sealed'", (pid,))["c"]
+
+        def act(name, ok, reasons, fix_page):
+            return {"action": name, "status": "可做" if ok else "需补齐",
+                    "reasons": reasons, "fix_entry": fix_page}
+
+        actions = []
+        if ready_map["runtime_fields"] and ready_map["models"] and prompt_n["c"] >= 1:
+            actions.append(act("生成种子输出", True,
+                               ["输入契约可渲染、模型连接有效（内置演示供应商即可）"], "P03"))
+        else:
+            miss = []
+            if prompt_n["c"] < 1:
+                miss.append("还没有提示词原文")
+            if not ready_map["models"]:
+                miss.append("没有可用模型连接")
+            actions.append(act("生成种子输出", False, miss or ["输入契约缺失"], "P03"))
+        if outputs_n >= 1 and ready_map["rubric"]:
+            actions.append(act("人工比较一个候选", True,
+                               ["已有实际输出与已发布评价标准；未校准评价器也可人工判断（R02）"], "P06"))
+        else:
+            miss = []
+            if outputs_n < 1:
+                miss.append("还没有实际输出：先运行一次原始测评或试运行")
+            if not ready_map["rubric"]:
+                miss.append("评价标准未发布")
+            actions.append(act("人工比较一个候选", False, miss, "P04"))
+        if ready_map["data"] and ready_map["manifest"] and ready_map["rubric"] and ready_map["models"]:
+            actions.append(act("自动批量搜索", True,
+                               ["开发/选择集已冻结、评价计划已确认、预算受账本约束；"
+                                + ("未校准评价器仅限探索模式（结果不用于自动确认）"
+                                   if not ready_map["judge"] else "评价器已审计")], "P10"))
+        else:
+            miss = []
+            if not ready_map["data"]:
+                miss.append("开发集为空")
+            if not ready_map["manifest"]:
+                miss.append("分组未冻结")
+            if not ready_map["rubric"]:
+                miss.append("评价标准未发布")
+            actions.append(act("自动批量搜索", False, miss, "P03"))
+        if sealed_n >= 1 and locked_run is not None:
+            actions.append(act("正式验证（独立验证）", True,
+                               [f"候选已锁定（运行 {locked_run['id'][:16]}…）；考题 {sealed_n} 条已封存，"
+                                "解封一次性消耗（一次绑定）"], "P12"))
+        else:
+            miss = []
+            if sealed_n < 1:
+                miss.append("没有已封存的考题（锁定分组时自动划分）")
+            if locked_run is None:
+                miss.append("还没有锁定候选的运行（在运行详情中锁定）")
+            actions.append(act("正式验证（独立验证）", False, miss, "P11"))
+        # 正式采用资格以报告的四层结论为准（与 eligibility 一致，避免页面互相矛盾）
+        if verified is not None and verified["decision"] == "verified_improvement":
+            erow = self.db.one("SELECT eligibility FROM acceptance_reports WHERE id=?",
+                               (verified["id"],))
+            elig = (erow["eligibility"] or "") if erow else ""
+            if "可正式采用" in elig:
+                actions.append(act("正式采用", True,
+                                   [f"验证有效报告（{verified['id']}）全部门槛通过，确认后更新正式指针"],
+                                   "P13"))
+            else:
+                actions.append(act("正式采用", False,
+                                   [f"验证有效报告（{verified['id']}）存在，但 {elig or '门槛未全通过'}"],
+                                   "P12"))
+        else:
+            actions.append(act("正式采用", False,
+                               ["还没有“验证有效”的独立验证报告；未验证候选只能保存为试用版本"], "P12"))
+
+        return {"state": state, "checks": checks, "actions": actions}
 
     def progress(self, pid: str) -> dict:
         """五步流程进度（优化1.0 §4.2）：每步为何要做、当前状态与下一步主行动。"""

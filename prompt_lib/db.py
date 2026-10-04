@@ -220,6 +220,26 @@ _MIGRATIONS = (
     ("runs", "best_detail_json",
      "ALTER TABLE runs ADD COLUMN best_detail_json TEXT NOT NULL DEFAULT '{}'"),
     ("runs", "stall_count", "ALTER TABLE runs ADD COLUMN stall_count INTEGER NOT NULL DEFAULT 0"),
+    # 07 方案 R03/16.5：封存考题"一次绑定"——验收记录与候选/基线/协议哈希绑定
+    ("acceptance_reports", "acceptance_id",
+     "ALTER TABLE acceptance_reports ADD COLUMN acceptance_id TEXT DEFAULT ''"),
+    ("acceptance_reports", "candidate_hash",
+     "ALTER TABLE acceptance_reports ADD COLUMN candidate_hash TEXT DEFAULT ''"),
+    ("acceptance_reports", "baseline_hash",
+     "ALTER TABLE acceptance_reports ADD COLUMN baseline_hash TEXT DEFAULT ''"),
+    ("acceptance_reports", "policy_hash",
+     "ALTER TABLE acceptance_reports ADD COLUMN policy_hash TEXT DEFAULT ''"),
+    # 07 方案 R12/17 节：四层分开——证据状态 / 质量结论 / 门槛 / 采用资格
+    ("acceptance_reports", "evidence_status",
+     "ALTER TABLE acceptance_reports ADD COLUMN evidence_status TEXT DEFAULT ''"),
+    ("acceptance_reports", "quality_decision",
+     "ALTER TABLE acceptance_reports ADD COLUMN quality_decision TEXT DEFAULT ''"),
+    ("acceptance_reports", "gates_json",
+     "ALTER TABLE acceptance_reports ADD COLUMN gates_json TEXT DEFAULT '{}'"),
+    ("acceptance_reports", "eligibility",
+     "ALTER TABLE acceptance_reports ADD COLUMN eligibility TEXT DEFAULT ''"),
+    ("acceptance_reports", "reason_codes_json",
+     "ALTER TABLE acceptance_reports ADD COLUMN reason_codes_json TEXT DEFAULT '[]'"),
 )
 
 

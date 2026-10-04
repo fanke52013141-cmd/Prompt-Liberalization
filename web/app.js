@@ -456,6 +456,16 @@ function flowIntro(what, provide, then) {
 /* ---------------- 项目主页（§4.2） ---------------- */
 PAGES.home = async (p) => {
   const prog = await getProgress(p.id);
+  api("GET", `/projects/${p.id}/readiness`).then(d => {
+    const el = document.getElementById("actions-block");
+    if (!el) return;
+    el.innerHTML = (d.actions || []).map(a => `<div class="check">
+      <span class="dot" style="color:${a.status === "可做" ? "var(--ok)" : "var(--warn)"}">${a.status === "可做" ? "✓" : "○"}</span>
+      <span style="flex:1"><b>${esc(a.action)}</b>——${esc(a.status)}
+        <div class="muted small">${(a.reasons || []).map(esc).join("；") || "无障碍"}</div></span>
+      <span class="muted small">补齐入口：${esc(a.fix_entry)}</span></div>`).join("")
+      + `<div class="muted small">资格由服务端按动作分别计算（07 方案 §12）；同一次准备可同时支持多个动作。</div>`;
+  }).catch(() => {});
   const cur = prog.steps.find(s => s.key === prog.current);
   const page = FLOW_PAGE[cur.key];
   const materials = [p.contract.runtime_fields.length ? "输入字段 " + p.contract.runtime_fields.map(f => f.label).join("、") : "",
@@ -486,15 +496,19 @@ PAGES.home = async (p) => {
       <a href="#/glossary" class="small">名词解释</a>
     </div>
     <p class="muted small">优化目标：${esc(p.contract.goal || "（尚未填写，可在“准备材料”中补充）")}</p>
-  </div>`;
+  </div>
+  <details><summary>按动作查看资格：现在能做什么、缺什么（点开查看）</summary>
+    <div id="actions-block" class="small muted">加载中…</div>
+  </details>`;
 };
 
 /* ---------------- 第一步：准备材料（§5） ---------------- */
 PAGES.materials = async (p) => {
   const prog = await getProgress(p.id);
-  const [items, ps] = await Promise.all([
+  const [items, ps, outbound] = await Promise.all([
     api("GET", `/projects/${p.id}/items?size=100`),
-    api("GET", `/projects/${p.id}/prompts`)]);
+    api("GET", `/projects/${p.id}/prompts`),
+    api("GET", `/projects/${p.id}/outbound-preview`).catch(() => null)]);
   const rt = p.contract.runtime_fields.map(f => esc(f.label)).join("、");
   const ev = p.contract.evaluation_fields.map(f => esc(f.label)).join("、") || "（无）";
   return `
@@ -555,6 +569,14 @@ PAGES.materials = async (p) => {
       <span style="flex:1">已有案例：<b>${items.total}</b> 条
       <a class="small" href="#/proj/${p.id}/data">查看与分配集合</a></span></div>
     <p class="muted small">字段名不能独自决定用途：参考答案等资料能否提供给执行模型，由实际业务确认。</p>
+    <details style="margin-top:6px"><summary>数据外发范围预览：哪些字段会被送给哪个角色（点开查看）</summary>
+      ${outbound ? outbound.roles.map(r => `<div class="check"><span class="dot" style="color:var(--brand)">→</span>
+        <span style="flex:1"><b>${esc(r.role)}</b> 接收：${esc(r.receives.join("、"))}
+        <div class="muted small">${esc(r.note)}</div></span></div>`).join("")
+        + `<div class="check"><span class="dot" style="color:var(--bad)">✕</span>
+        <span style="flex:1">绝不外发：${esc(outbound.never_sent.join("；"))}</span></div>`
+        : `<div class="muted small">（外发预览暂不可用）</div>`}
+    </details>
   </div>
   <div class="card">
     <b>锁定案例分组（用于最后的独立检验）</b>
@@ -1159,8 +1181,10 @@ function decisionPill(d) {
 }
 PAGES.verify = async (p) => {
   const prog = await getProgress(p.id);
-  const [runs, reps] = await Promise.all([
-    api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/reports`)]);
+  const [runs, reps, mans] = await Promise.all([
+    api("GET", `/projects/${p.id}/runs`), api("GET", `/projects/${p.id}/reports`),
+    api("GET", `/projects/${p.id}/manifests`)]);
+  const sealedN = mans.sealed_count || 0;
   const done = runs.runs.filter(r => r.state === "completed" && r.locked_candidate);
   const runOpts = done.map(r => `<option value="${r.id}">${esc(r.id)}（锁定：${esc(r.locked_candidate)}）</option>`).join("");
   const repRows = reps.reports.map(r => `
@@ -1193,6 +1217,7 @@ PAGES.verify = async (p) => {
       <div class="legend-chip"><span class="dot2" style="background:var(--muted)"></span><span><b>评价无效</b><small>评分过程出错，结论不可信</small></span></div>
     </div>
     ${done.length ? "" : `<p class="small muted" style="margin-top:4px">还没有可验证的运行：先在「自动优化」里完成一次运行，并在运行详情中锁定待验证版本（或保留原版）。</p>`}
+    ${sealedN ? `<div class="tip"><b>人工投入估算：</b>当前封存考题 ${sealedN} 组，最终盲评约需 ${sealedN} × 2 分钟 ≈ <b>${sealedN * 2} 分钟</b>（按“一对约2分钟”的演示口径；实际以试标中位耗时为准，不要按“条”误算）。</div>` : ""}
   </div>
   <div class="card">
     <b>验证报告</b>
@@ -1240,6 +1265,7 @@ async function renderReportDetail(repId) {
     </div>
     <button class="grey" onclick="copyPrompt('${r.candidate_ref}')">复制候选提示词</button>
     <button class="grey" onclick="exportReport('${r.id}')">导出报告（JSON）</button>
+    <button class="grey" onclick="exportUsePackage('${r.id}')" title="提示词正文+变量+哈希+适用范围，不含密钥与考题原文">下载使用包（JSON）</button>
     <span class="muted small">复制文本≠验证通过：只有结论为“验证有效”时才建议正式采用。</span>`;
   } catch (e) { promptBlock = `<p class="muted small">（提示词明细不可用）</p>`; }
   const stat = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
@@ -1250,6 +1276,22 @@ async function renderReportDetail(repId) {
       先看第 1 节的结论和建议；第 2、3 节回答“你最关心的问题解决了吗、有没有改出新问题”；
       第 4 节是独立考题上的对照数据；第 6 节可直接复制新提示词。统计术语可悬停查看，也可查「名词解释」。</div>
     ${nextBox}
+    ${(() => {
+      const g = r.gates || {};
+      const gateRow = Object.entries(g).map(([k, v]) =>
+        `<div class="stat"><div class="k">${esc(k)}</div><div class="v small" style="font-size:13px">${esc(v.result)}</div><div class="sub2 small muted">${esc(v.detail || "")}</div></div>`).join("");
+      const reasons = (r.reason_codes || []).map(r => `<li>${esc(r)}</li>`).join("");
+      return `<div class="report-section"><h2>结论分层（证据 → 质量 → 门槛 → 采用资格）</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="k">证据状态</div><div class="v small" style="font-size:14px">${esc(r.evidence_status || "-")}</div></div>
+        <div class="stat"><div class="k">质量结论</div><div class="v small" style="font-size:14px">${esc(r.quality_decision || "-")}</div></div>
+        ${gateRow}
+        <div class="stat"><div class="k">采用资格</div><div class="v small" style="font-size:14px">${esc(r.eligibility || "-")}</div></div>
+      </div>
+      ${reasons ? `<ul class="vp-list small">${reasons}</ul>` : ""}
+      ${r.acceptance_id ? `<div class="small muted">一次绑定：考题已绑定本报告（候选 ${esc(((r.binding)||{}).candidate_hash)}…/协议 ${esc(((r.binding)||{}).policy_hash)}…），不能再为新候选提供独立证明。</div>` : ""}
+      </div>`;
+    })()}
     <div class="report-section"><h2>1. 结论</h2>
       <div class="stat-grid">
         ${stat("结论", decisionPill(r.decision))}
@@ -1312,6 +1354,16 @@ async function copyPrompt(pvid) {
     document.execCommand("copy"); document.body.removeChild(ta);
     toast("提示词已复制");
   }
+}
+function exportUsePackage(repId) {
+  api("GET", `/reports/${repId}/package`).then(pkg => {
+    const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `使用包_${repId}.json`;
+    a.click(); URL.revokeObjectURL(a.href);
+    toast("使用包已下载（不含密钥与考题原文；换模型或改提示词后请重新比较）");
+  }).catch(e => toast(errText(e), true));
 }
 function exportReport(repId) {
   api("GET", `/reports/${repId}`).then(r => {

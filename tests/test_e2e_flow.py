@@ -57,10 +57,12 @@ def test_full_loop_case_to_feedback(client):
                                "inconclusive", "evaluation_invalid")
     st = rep["stats"]
     assert st["group_n"] + st["unknown"] == st["sealed_total"]  # 未知项不删除（TC046）
-    # 测试集已消耗：再次验收被拒（TC043）
+    # 测试集一次绑定（07方案 R03/TC064）：同运行同候选重复申请 → 幂等返回原报告；
+    # 为新候选复用同一考题 → 拒绝（详见 test_review_plan.py::test_tc063）
     acc2 = client.post(f"/workflow-api/v1/runs/{run['id']}/accept")
-    assert acc2.status_code == 409
-    assert acc2.json()["code"] == "TEST_ALREADY_CONSUMED"
+    assert acc2.status_code == 202
+    assert acc2.json()["id"] == rep["id"]
+    assert acc2.json().get("idempotent") is True
 
     # 5) 采用：verified 才能active；否则trial
     if rep["decision"] == "verified_improvement":

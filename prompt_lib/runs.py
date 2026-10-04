@@ -96,8 +96,12 @@ class RunService:
             "use_sealed_test": True, "n_min_groups": 2})
         return normalized
 
-    def estimate(self, draft: dict) -> dict:
-        """费用预估区间：基于样本量与每请求token假设，不含校准与重试（开发方案第8节）。"""
+    def estimate(self, draft: dict, pid: str | None = None) -> dict:
+        """费用预估区间：基于样本量与每请求token假设，不含校准与重试（开发方案第8节）。
+
+        07 方案 R08/§16.4：启动前同时估算模型费用与人工评审工时（按“对”计），
+        不在启动页固定承诺几十分钟完成。
+        """
         dev_n = len((draft.get("data") or {}).get("dev_item_ids") or [])
         cand = int((draft.get("optimization") or {}).get("max_candidates") or 0)
         gen_calls = dev_n * (1 + cand)
@@ -108,8 +112,19 @@ class RunService:
         op_in, op_out = 6000, 1600
         total = (gen_calls * (gen_in + gen_out) + eval_calls * (ev_in + ev_out)
                  + opt_calls * (op_in + op_out))
+        human = {}
+        if pid:
+            sealed_n = self.db.one(
+                "SELECT COUNT(*) AS c FROM sealed_artifacts WHERE project_id=?"
+                " AND access_state='sealed'", (pid,))["c"]
+            if sealed_n:
+                human = {"review_pairs": sealed_n, "minutes_per_pair": 2,
+                         "estimated_minutes": sealed_n * 2,
+                         "note": ("按“一对输出约2分钟”的演示口径估算最终盲评工时（未含校准/仲裁）；"
+                                  "实际以试标中位耗时为准，不要按“条”误算")}
         return {"generation_calls": gen_calls, "evaluation_calls": eval_calls,
                 "optimizer_calls": opt_calls, "estimated_tokens": total,
+                "human_review": human,
                 "note": "为说明计算方法的假设区间，非报价；由硬预算控制上限"}
 
     # ---------------- 创建（幂等 TC035）
@@ -636,18 +651,39 @@ class AcceptanceService:
             jr = self.db.one("SELECT status FROM judges WHERE id=?", (judge_id,))
             if jr and jr["status"] == "stale":
                 raise BizError("JUDGE_STALE", "评价器已stale，不能用于确认性验收", status=422)
-        # 解封（消耗性）
-        sealed = DataService(self.db).unseal_for_acceptance(run["project_id"])
-        if not sealed:
-            raise BizError("TEST_ALREADY_CONSUMED",
-                           "封存测试集不存在或已消耗：测试明细用于改写后不能再次作为独立证明（TC043）",
-                           status=409)
+        # 先解析候选身份，再检查考题绑定（07 方案 R03/16.5：一次绑定原则）
         candidates = {c["candidate_id"]: c for c in run["candidates"]}
         if run["locked_candidate"] == "baseline":
             cand_pv_id = run["baseline_prompt_id"]
         else:
             cand_pv_id = candidates[run["locked_candidate"]]["prompt_version_id"]
         baseline_pv_id = run["baseline_prompt_id"]
+        prev = self.db.one(
+            "SELECT * FROM acceptance_reports WHERE run_id=? AND candidate_ref=?"
+            " ORDER BY created_at DESC LIMIT 1", (rid, cand_pv_id))
+        if prev is not None:
+            # 同一运行 + 同一候选 + 同一协议：幂等续跑，返回原报告（TC064）
+            out = self.get(prev["id"])
+            out["idempotent"] = True
+            out["idempotent_note"] = "该候选的独立验收已存在，返回原报告（未重复消耗考题，TC064）"
+            return out
+        bound = self.db.one(
+            "SELECT * FROM acceptance_reports WHERE project_id=? AND consumed=1"
+            " ORDER BY created_at DESC LIMIT 1", (run["project_id"],))
+        if bound is not None:
+            raise BizError(
+                "TEST_ALREADY_CONSUMED",
+                f"该批考题已绑定验收报告 {bound['id']}（候选 {bound['candidate_ref']}，"
+                f"{bound['created_at']}）。按一次绑定原则，即使只看过汇总分数，"
+                "同一考题也不能为新候选提供新的独立证明；请补充新的独立考题（TC063）。",
+                field_errors={"bound_report": bound["id"],
+                              "bound_candidate": bound["candidate_ref"]}, status=409)
+        # 解封（消耗性）
+        sealed = DataService(self.db).unseal_for_acceptance(run["project_id"])
+        if not sealed:
+            raise BizError("TEST_ALREADY_CONSUMED",
+                           "封存测试集不存在或已消耗：测试明细用于改写后不能再次作为独立证明（TC043）",
+                           status=409)
         models = snapshot["models"]
         budget = BudgetState(run["budget"])
         ledger = Ledger(self.db)
@@ -740,6 +776,64 @@ class AcceptanceService:
             decision = "regression"
         else:
             decision = "no_improvement"
+
+        # ---- 07 方案 R12/§17：四层分开——证据 / 质量 / 门槛 / 采用资格 ----
+        min_groups = int(policy.get("min_test_groups", 5))
+        unknown_ratio = unknown / max(1, len(pairs))
+        gate_severe = severe_cand == 0
+        gate_sample = n >= min_groups
+        gate_evidence = n > 0 and unknown_ratio <= 0.2
+        gates = {
+            "严重错误门槛": {"result": "通过" if gate_severe else "未通过",
+                        "detail": (f"候选严重错误 {severe_cand} 个（基线 {severe_base} 个）"
+                                   if not gate_severe else
+                                   f"候选严重错误 0 观察；95%置信上界 "
+                                   f"{(sev_upper * 100):.2f}%" if sev_upper is not None
+                                   else "候选严重错误 0 观察")},
+            "样本充足门槛": {"result": "通过" if gate_sample else "不足",
+                        "detail": f"独立考题 {n} 组（建议至少 {min_groups} 组）"},
+            "证据有效性": {"result": "有效" if gate_evidence else "资料不足",
+                      "detail": f"无法判断 {unknown}/{len(pairs)} 条，未从分母静默删除"},
+        }
+        quality_map = {
+            "verified_improvement": "改善",
+            "no_improvement": "尚未证明改善",
+            "regression": "退步",
+            "inconclusive": "无法判断（证据不足）",
+            "evaluation_invalid": "无法判断（评价无效）",
+        }
+        quality_decision = quality_map.get(decision, decision)
+        evidence_status = "有效" if gate_evidence else "资料不足"
+        # 决策顺序（§17）：先证据有效性，再严重错误阻断，再看质量与样本
+        if not gate_evidence:
+            eligibility = "暂缓正式采用（补充考题后重新验证）"
+            reason_codes = ["证据不足：无法判断项占比过高，不产生正式改善结论"]
+        elif not gate_severe:
+            eligibility = "不可正式采用（保留原版）"
+            reason_codes = ["严重错误门槛未通过：候选出现严重错误，均分不能掩盖（TC046）"]
+        elif decision == "verified_improvement":
+            if gate_sample:
+                eligibility = "可正式采用（仍需负责人确认）"
+                reason_codes = ["主指标改善且配对区间下界>0", "严重错误门槛通过", "样本充足"]
+            else:
+                eligibility = "暂缓正式采用（补充考题后重新验证）"
+                reason_codes = [f"样本不足：考题仅 {n} 组（建议≥{min_groups}）",
+                                "趋势正向有希望，但尚未证明改善；可先保存为试用版本"]
+        elif decision == "no_improvement":
+            eligibility = "保留原版"
+            reason_codes = ["未见改善：未证实改善不等于已证明等效；保留原版为正常结果"]
+        elif decision == "regression":
+            eligibility = "不可正式采用（保留原版）"
+            reason_codes = ["质量退步或严重错误阻断"]
+        else:
+            eligibility = "暂缓正式采用"
+            reason_codes = ["证据不足，无法判断"]
+        acceptance_id = new_id("acc")
+        from .domain import PromptService as _PS
+        cand_hash = _PS(self.db).get(cand_pv_id)["hash"]
+        base_hash = _PS(self.db).get(baseline_pv_id)["hash"]
+        policy_hash = canonical_hash(policy)
+
         # 问题项口径（§9.3）：完全解决/部分解决/未解决/无法判断 分开统计；
         # ABCD 分布同时展示原问题改善与新增问题两个维度，无法判断单独记录
         resolution = {"resolved": 0, "partial": 0, "unresolved": 0, "unknown": 0,
@@ -805,12 +899,24 @@ class AcceptanceService:
         rep_id = new_id("rep")
         self.db.execute(
             "INSERT INTO acceptance_reports(id,run_id,project_id,candidate_ref,baseline_ref,"
-            "test_manifest_json,policy_json,stats_json,decision,consumed,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?, '1', ?)",
+            "test_manifest_json,policy_json,stats_json,decision,consumed,created_at,"
+            "acceptance_id,candidate_hash,baseline_hash,policy_hash,"
+            "evidence_status,quality_decision,gates_json,eligibility,reason_codes_json)"
+            " VALUES(?,?,?,?,?,?,?,?,?, '1', ?,?,?,?,?,?,?,?,?,?)",
             (rep_id, rid, run["project_id"], cand_pv_id, baseline_pv_id,
-             json.dumps({"sealed_items": [p["item_id"] for p in pairs]}, ensure_ascii=False),
+             json.dumps({"sealed_items": [p["item_id"] for p in pairs],
+                         "acceptance_id": acceptance_id,
+                         "candidate_hash": cand_hash, "baseline_hash": base_hash,
+                         "policy_hash": policy_hash}, ensure_ascii=False),
              json.dumps(policy, ensure_ascii=False), json.dumps(stats, ensure_ascii=False),
-             decision, now_iso()))
+             decision, now_iso(), acceptance_id, cand_hash, base_hash, policy_hash,
+             evidence_status, quality_decision,
+             json.dumps(gates, ensure_ascii=False), eligibility,
+             json.dumps(reason_codes, ensure_ascii=False)))
+        # 考题曝光事件（R03/16.5：暴露与用途消耗可审计，不依赖用户自报）
+        RunService(self.db)._audit("sealed.exposure",
+                                   f"{rep_id}|candidate={cand_hash[:12]}|protocol={policy_hash[:12]}",
+                                   canonical_hash({"sealed": [p["item_id"] for p in pairs]}))
         RunService(self.db)._audit("acceptance.complete", rep_id, canonical_hash(stats))
         with self.db.tx() as conn:
             RunService(self.db)._emit(conn, rid, None, "acceptance_done",
@@ -824,7 +930,17 @@ class AcceptanceService:
         return {"id": r["id"], "run_id": r["run_id"], "project_id": r["project_id"],
                 "candidate_ref": r["candidate_ref"], "baseline_ref": r["baseline_ref"],
                 "decision": r["decision"], "consumed": bool(r["consumed"]),
-                "stats": jloads(r["stats_json"], {}), "created_at": r["created_at"]}
+                "stats": jloads(r["stats_json"], {}), "created_at": r["created_at"],
+                # 07 方案四层分开：证据状态 / 质量结论 / 门槛 / 采用资格（旧报告字段为空）
+                "acceptance_id": r["acceptance_id"] or "",
+                "binding": {"candidate_hash": (r["candidate_hash"] or "")[:16],
+                            "baseline_hash": (r["baseline_hash"] or "")[:16],
+                            "policy_hash": (r["policy_hash"] or "")[:16]},
+                "evidence_status": r["evidence_status"] or "",
+                "quality_decision": r["quality_decision"] or "",
+                "gates": jloads(r["gates_json"], {}),
+                "eligibility": r["eligibility"] or "",
+                "reason_codes": jloads(r["reason_codes_json"], [])}
 
     def list(self, pid: str) -> list[dict]:
         return [self.get(r["id"]) for r in self.db.query(
