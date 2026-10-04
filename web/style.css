@@ -275,3 +275,5 @@ details > summary:hover { color: var(--brand); }
 .gloss-block.why span { color: var(--ok); }
 /* 空状态统一 */
 .empty { border: 1px dashed var(--line-strong); border-radius: var(--radius); background: #fbfcfe; }
+/* 审查修复：表头短词不断行，避免“版 本”竖排 */
+th { white-space: nowrap; }

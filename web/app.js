@@ -1769,7 +1769,8 @@ PAGES.acceptance = async (p) => {
   const repRows = reps.reports.map(r => `
     <tr><td class="small">${esc(r.id)}</td><td>${decisionPill(r.decision)}</td>
     <td>${(r.stats.diff * 100).toFixed(1)}pp</td>
-    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td></tr>`).join("");
+    <td class="small">n=${r.stats.group_n}（未知${r.stats.unknown}）</td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted small" style="text-align:center">暂无报告——完成独立验证后自动生成</td></tr>`;
   return `
   ${advIntro("独立验收的原始入口；常规使用建议走第五步「验证与使用」，那里有更完整的报告解读。")}
   <div class="card"><b>发起独立验收</b>
@@ -1795,10 +1796,12 @@ PAGES.usage = async (p) => {
   const hist = rel.history.map(h => `
     <tr><td class="small">${esc(h.id)}</td><td class="small">${esc(h.prompt_version_id)}</td>
     <td>${pill(h.status, h.status === "active" ? "ok" : h.status === "trial" ? "warn" : "")}</td>
-    <td class="small">${esc(fmtTime(h.created_at))}</td></tr>`).join("");
+    <td class="small">${esc(fmtTime(h.created_at))}</td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted small" style="text-align:center">暂无发布记录——完成验证后即可正式采用</td></tr>`;
   const fbRows = fb.feedback.map(f => `
     <tr><td class="small">${esc({direct:"直接采用",minor_edit:"轻微修改",major_edit:"实质修改",abandoned:"放弃"}[f.adoption] || f.adoption)}</td><td class="small">${esc(f.reason)}</td>
-    <td class="small">${esc(f.status)}</td><td class="small">${esc(fmtTime(f.created_at))}</td></tr>`).join("");
+    <td class="small">${esc(f.status)}</td><td class="small">${esc(fmtTime(f.created_at))}</td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted small" style="text-align:center">暂无反馈——使用后欢迎回来记录实际效果</td></tr>`;
   return `
   ${advIntro("发布与回滚记录：正式采用必须绑定“验证有效”的报告；这里保留全部历史，回滚不删除任何记录。")}
   <div class="card"><b>当前使用版本</b>
