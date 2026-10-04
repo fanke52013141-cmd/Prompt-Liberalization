@@ -117,7 +117,18 @@ def judge_score_output(output_text: str, dimensions: list[str]) -> dict:
                 or "论据" in dim or "获得" in dim:
             scores[dim] = 3 if ("依据" in output_text or "定位" in output_text) else 2
         else:
-            scores[dim] = 2
+            # 自由维度按输出整体质量分级：结构完整（结论+定位+可执行建议）→3、
+            # 有部分结构 →2、空泛无结构 →1。
+            # 修复走查发现：此前恒定给 2 分，自定义任务（推荐路径）永远测不出优化效果
+            has_conclusion = ("结论" in output_text or "判断正确" in output_text)
+            has_location = "定位" in output_text
+            has_action = ("可执行建议" in output_text or "按以下步骤" in output_text)
+            if has_conclusion and has_location and has_action:
+                scores[dim] = 3
+            elif has_location or has_action or has_conclusion:
+                scores[dim] = 2
+            else:
+                scores[dim] = 1
     return {"scores": scores, "abstain": False}
 
 
