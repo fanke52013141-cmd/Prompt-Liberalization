@@ -525,7 +525,13 @@ def compute_verdict(conn, run):
         return "no_diff"
 
     lv = level()
-    if kind == "explore":
+    too_ambiguous = n >= 5 and unknown_pref * 2 > n
+    if too_ambiguous:
+        headline = "很多份都说不上来——先弄清楚「什么样算能用」，比了才有意义。"
+        tail = "判断标准立起来之后，攒一批新例子重新比一次，这一轮的记录仍然保留。"
+        lines.append("这份判断标准还没立起来：说不上来的份数超过一半。建议回到例子，"
+                     "先想清楚一两条明确的「能用/不能用」判断依据，再比较。")
+    elif kind == "explore":
         headline = {
             "too_few": "比较的份数太少，只能当参考。",
             "proof": "看起来新版更好——但这只是探索，份数还不够下结论。",
