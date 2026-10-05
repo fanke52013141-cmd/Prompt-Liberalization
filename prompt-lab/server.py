@@ -1520,7 +1520,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass  # 客户端已断开（刷新/关标签页），无处可写，静默即可
 
     def _json(self, obj, code=200):
         self._send(code, "application/json; charset=utf-8",
@@ -1558,6 +1561,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     result = fn(self, match)
                     self._json(result)
+                except (ConnectionResetError, BrokenPipeError):
+                    return  # 客户端已断开，无需也不能再回错误响应
                 except ApiError as e:
                     self._json({"ok": False, "message": e.msg}, e.code)
                 except Exception as e:  # noqa: BLE001 兜底，避免线程静默
