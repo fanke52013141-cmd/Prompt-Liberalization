@@ -68,6 +68,21 @@ function toast(msg) {
   toastTimer = setTimeout(function () { t.classList.add("hidden"); }, 3600);
 }
 
+/* 防重复点击：同名的动作在完成前只允许触发一次 */
+function once(key, fn) {
+  if (window["_busy_" + key]) return Promise.resolve();
+  window["_busy_" + key] = true;
+  var done = function () { window["_busy_" + key] = false; };
+  var p;
+  try {
+    p = fn();
+  } catch (e) { done(); throw e; }
+  if (p && typeof p.finally === "function") { p["finally"](done); }
+  else if (p && typeof p.then === "function") { p.then(done, done); }
+  else { done(); }
+  return p;
+}
+
 function setNav(name) {
   var links = document.querySelectorAll("#nav a");
   for (var i = 0; i < links.length; i++) {
@@ -143,8 +158,16 @@ async function viewHome() {
     if (p.official_v != null) tags += '<span class="badge official">正式 v' + p.official_v + "</span>";
     if (p.trial_v != null) tags += '<span class="badge trial">试用 v' + p.trial_v + "（未考试）</span>";
     if (!tags) tags = '<span class="badge gray">还没有正式版或试用版</span>';
+    var todo = "";
+    if (p.pending_runs && p.pending_runs.length) {
+      todo = "有 " + p.pending_runs.length + " 轮优化没走完（" +
+        (RUN_STATE_LABEL[p.pending_runs[0].state] || p.pending_runs[0].state) + "）";
+    } else if (p.trial_v != null && !p.exams_done) {
+      todo = "试用版还没考过试，攒够新例子就可以「考个试」";
+    }
     html += '<div class="list-item"><div class="title">' + esc(p.name) + tags + "</div>" +
       '<div class="meta">例子 ' + p.cases + " 条 · 日常用过 " + p.usage + " 次</div>" +
+      (todo ? '<div class="meta" style="color:var(--warn)">' + esc(todo) + "</div>" : "") +
       '<div class="btn-row"><a class="btn" href="#/prompt/' + p.id + '">打开</a>' +
       '<a class="btn" href="#/use">用一用</a></div></div>';
   }
@@ -176,9 +199,12 @@ window.addExample = function () {
 };
 
 async function viewNew() {
+  var state = await api("/api/state");
   $app.innerHTML =
     "<h1>新建优化</h1>" +
     '<p class="sub">四步：贴提示词 → 贴几个真实例子 → 指出问题 → 比一比。全程只花几毛到几块钱（上限在设置里）。</p>' +
+    (state.configured ? "" :
+      '<div class="banner warn">还没配置 AI 接口，这份表单填完也跑不起来。建议先去 <a href="#/settings">设置</a> 填好接口地址、密钥和模型名。</div>') +
     '<div class="card">' +
     '<label class="field"><span>给它起个名字</span>' +
     '<input type="text" id="np-name" placeholder="给它起个好认的名字，随你取" maxlength="50"></label>' +
@@ -193,26 +219,36 @@ async function viewNew() {
     '<span class="muted small">下一步会先给每个例子生成一次输出，让你看清现状。</span></div>' +
     "</div>";
 }
-window.submitNew = async function () {
-  var name = document.getElementById("np-name").value.trim() || "未命名提示词";
-  var content = document.getElementById("np-content").value.trim();
-  if (!content) { toast("先把你在用的提示词贴进来。"); return; }
-  var ins = document.querySelectorAll("textarea[name=ex-in]");
-  var refs = document.querySelectorAll("textarea[name=ex-ref]");
-  var cases = [];
-  for (var i = 0; i < ins.length; i++) {
-    var t = ins[i].value.trim();
-    if (t) cases.push({ input: t, reference: refs[i] ? refs[i].value.trim() : "" });
-  }
-  if (cases.length < 2) { toast("至少贴 2 个例子，才能看出问题是不是反复出现。"); return; }
-  var p = await api("/api/prompts", { body: { name: name, content: content } });
-  await api("/api/prompts/" + p.prompt_id + "/cases", { body: { cases: cases } });
-  var detail = await api("/api/prompts/" + p.prompt_id);
-  var ids = detail.cases.map(function (c) { return c.id; }).reverse().slice(0, cases.length);
-  var r = await api("/api/runs", { body: {
-    prompt_id: p.prompt_id, kind: "explore",
-    base_version_id: p.version_id, case_ids: ids } });
-  location.hash = "#/run/" + r.run_id;
+window.submitNew = function () {
+  return once("new", async function () {
+    var name = document.getElementById("np-name").value.trim() || "未命名提示词";
+    var content = document.getElementById("np-content").value.trim();
+    if (!content) { toast("先把你在用的提示词贴进来。"); return; }
+    var ins = document.querySelectorAll("textarea[name=ex-in]");
+    var refs = document.querySelectorAll("textarea[name=ex-ref]");
+    var cases = [];
+    for (var i = 0; i < ins.length; i++) {
+      var t = ins[i].value.trim();
+      if (t) cases.push({ input: t, reference: refs[i] ? refs[i].value.trim() : "" });
+    }
+    if (cases.length < 2) { toast("至少贴 2 个例子，才能看出问题是不是反复出现。"); return; }
+    var p = await api("/api/prompts", { body: { name: name, content: content } });
+    await api("/api/prompts/" + p.prompt_id + "/cases", { body: { cases: cases } });
+    var detail = await api("/api/prompts/" + p.prompt_id);
+    var ids = detail.cases.map(function (c) { return c.id; }).reverse().slice(0, cases.length);
+    var r;
+    try {
+      r = await api("/api/runs", { body: {
+        prompt_id: p.prompt_id, kind: "explore",
+        base_version_id: p.version_id, case_ids: ids } });
+    } catch (e2) {
+      toast(e2.message + "（提示词和例子已保存，可到「我的提示词」里继续）");
+      location.hash = "#/prompt/" + p.prompt_id;
+      return;
+    }
+    try { await api("/api/runs/" + r.run_id + "/step/base", { body: {} }); } catch (e3) { /* 留在就绪页显示原因 */ }
+    location.hash = "#/run/" + r.run_id;
+  });
 };
 
 /* ---------- 运行页（探索与考试共用） ---------- */
@@ -245,7 +281,7 @@ function renderRun(runId, data) {
       "，预计约 " + est + " 次调用，上限是 " +
       (run.cap_type === "money" ? ("约 " + run.cap_value + " 元") : (run.cap_value + " 次")) +
       "，到上限会自动停。</p>" +
-      '<div class="btn-row"><button class="btn primary big" onclick="startBase(' + runId + ")'>" +
+      '<div class="btn-row"><button class="btn primary big" onclick="startBase(' + runId + ')">' +
       (run.kind === "validate" ? "开始考试" : "开始生成") + "</button></div></div>";
   } else if (st === "generating_base" || st === "generating_candidate") {
     var done = st === "generating_base" ? data.base_done : (data.cand_done || 0);
@@ -272,20 +308,27 @@ function renderRun(runId, data) {
     var capBtn = st === "paused_cap"
       ? '<button class="btn primary" onclick="raiseCapAndResume(' + runId + ')">提高上限并继续</button>'
       : "";
+    var retryLabel = st === "failed" ? "重试" : "继续（上限没变）";
+    var goSettings = st === "failed"
+      ? '<a class="btn" href="#/settings">去设置检查接口</a>'
+      : '<a class="btn" href="#/settings">去设置调整上限</a>';
     body = '<div class="card"><p>' + esc(run.error || "已停止。") + "</p>" +
       '<div class="btn-row">' + capBtn +
-      '<button class="btn" onclick="resumeRun(' + runId + ')">继续（上限没变）</button></div></div>';
+      '<button class="btn" onclick="resumeRun(' + runId + ')">' + retryLabel + "</button>" +
+      goSettings + "</div></div>";
   } else {
     body = '<div class="card"><p class="muted">' + (RUN_STATE_LABEL[st] || st) + "</p></div>";
   }
   $app.innerHTML = head + body;
 }
 
-window.startBase = async function (runId) {
+window.startBase = function (runId) {
+  return once("sbase", async function () {
   try {
     await api("/api/runs/" + runId + "/step/base", { body: {} });
     viewRun(runId);
   } catch (e) { toast(e.message); }
+  });
 };
 window.stopRun = async function (runId) {
   try { var r = await api("/api/runs/" + runId + "/stop", { body: {} }); toast(r.message); }
@@ -359,16 +402,23 @@ window.pickOpt = function (btn) {
 window.submitRatings = async function (runId) {
   var cards = document.querySelectorAll(".card[data-oid]");
   var ratings = [];
+  var skipped = 0;
   for (var i = 0; i < cards.length; i++) {
     var c = cards[i];
     var sel = c.querySelector(".opt-row .opt.sel");
+    if (!c.querySelector(".opt-row")) { skipped++; continue; } // 生成失败的输出不用评
     if (!sel) { toast("还有一份没选「能不能用」（可以选「说不上来」）。"); return; }
     var note = c.querySelector("input[data-role=note]");
     ratings.push({ output_id: parseInt(c.getAttribute("data-oid"), 10),
       usable: sel.getAttribute("data-v"),
       problem_note: note ? note.value.trim() : "" });
   }
+  if (!ratings.length) {
+    toast("这一轮没有生成成功的输出，没法继续改写。请回提示词页检查接口后重新开始一轮。");
+    return;
+  }
   await api("/api/runs/" + runId + "/ratings", { body: { ratings: ratings } });
+  if (skipped) toast("有 " + skipped + " 条没生成成功，已跳过，不影响其余的。");
   renderImprove(runId);
 };
 
@@ -422,7 +472,8 @@ async function renderCandidate(runId) {
     '<span class="muted small">接下来会给同样几个例子生成新版的输出，然后左右打乱让你盲评。</span></div>' +
     "</div>";
 }
-window.confirmCandidate = async function (runId) {
+window.confirmCandidate = function (runId) {
+  return once("cand", async function () {
   var content = document.getElementById("cand-content").value.trim();
   if (!content) { toast("新提示词内容不能为空。"); return; }
   try {
@@ -430,6 +481,7 @@ window.confirmCandidate = async function (runId) {
     await api("/api/runs/" + runId + "/step/candidate", { body: {} });
     viewRun(runId);
   } catch (e) { toast(e.message); }
+  });
 };
 
 /* ----- 盲评比较 ----- */
@@ -619,7 +671,9 @@ async function viewPrompt(pid) {
       html += '<div class="list-item"><div class="title">' +
         (run.kind === "validate" ? "考试" : "探索") +
         ' <span class="badge gray">' + (RUN_STATE_LABEL[run.state] || run.state) + "</span></div>" +
-        '<div class="meta">' + esc(run.created_at) + (verdictNote ? " · " + esc(verdictNote) : "") + "</div>" +
+        '<div class="meta">' + esc(run.created_at) +
+        (run.error ? " · " + esc(String(run.error).slice(0, 60)) : "") +
+        (verdictNote ? " · " + esc(verdictNote) : "") + "</div>" +
         '<div class="btn-row"><a class="btn" href="#/run/' + run.id + '">打开</a></div></div>';
     }
   }
@@ -667,7 +721,8 @@ async function viewPrompt(pid) {
   for (var vi2 = 0; vi2 < d.versions.length; vi2++) {
     var v = d.versions[vi2];
     var ops = '<a href="javascript:void(0)" onclick="viewVersion(' + v.id + "," + pid + ')">查看</a> ' +
-      '<a href="javascript:void(0)" onclick="makeOfficial(' + pid + "," + v.id + ',this)">设为正式</a>';
+      '<a href="javascript:void(0)" onclick="makeOfficial(' + pid + "," + v.id + ',this)">设为正式</a>' +
+      (v.id !== p.trial_version_id ? ' <a href="javascript:void(0)" onclick="makeTrial(' + pid + "," + v.id + ')">设为试用</a>' : "");
     if (p.official_version_id && v.id !== p.official_version_id) {
       ops += ' <a href="javascript:void(0)" onclick="makeOfficial(' + pid + "," + v.id + ',this)">回滚到此版</a>';
     }
@@ -683,9 +738,33 @@ window.viewVersion = async function (vid, pid) {
   var html = "<h1>v" + v.version_no + " " + esc(v.label || "") + "</h1>" +
     '<p class="sub">' + (v.note ? esc(v.note) + " · " : "") + esc(v.created_at) + ' · <a href="#/prompt/' + pid + '">返回</a></p>' +
     '<div class="card"><div class="prompt-box">' + esc(v.content) + "</div>" +
-    '<div class="btn-row"><button class="btn" onclick="copyText(window._v)">复制全文</button></div></div>';
+    '<div class="btn-row"><button class="btn" onclick="copyText(window._v)">复制全文</button>' +
+    '<button class="btn" onclick="editVersion(' + v.id + "," + pid + ')">手动改一版（存为新版本，不动这版）</button></div>' +
+    '<div id="ver-edit"></div></div>';
   window._v = v.content;
   $app.innerHTML = html;
+};
+window.editVersion = function (vid, pid) {
+  document.getElementById("ver-edit").innerHTML =
+    '<label class="field mt"><span>v' + vid + " 的新版本（改完保存，v" + vid + " 原样保留）</span>" +
+    '<textarea id="ver-content" style="min-height:200px">' + esc(window._v) + "</textarea></label>" +
+    '<div class="btn-row"><button class="btn primary" onclick="saveNewVersion(' + pid + ')">保存为新版本</button></div>';
+};
+window.saveNewVersion = async function (pid) {
+  var content = document.getElementById("ver-content").value.trim();
+  if (!content) { toast("内容不能为空。"); return; }
+  try {
+    await api("/api/prompts/" + pid + "/versions", { body: { content: content, note: "手动修改" } });
+    toast("已保存为新版本，原版本原样保留。");
+    viewPrompt(pid);
+  } catch (e) { toast(e.message); }
+};
+window.makeTrial = async function (pid, vid) {
+  try {
+    var r = await api("/api/prompts/" + pid + "/set_trial", { body: { version_id: vid } });
+    toast(r.message);
+    viewPrompt(pid);
+  } catch (e) { toast(e.message); }
 };
 window.makeOfficial = async function (pid, vid, el) {
   if (!window.confirm("把这一版设为正式版？\n如果它没考过试，等于没验证就上岗（随时可回滚）。")) return;
@@ -695,7 +774,8 @@ window.makeOfficial = async function (pid, vid, el) {
     viewPrompt(pid);
   } catch (e) { toast(e.message); }
 };
-window.startExplore = async function (pid) {
+window.startExplore = function (pid) {
+  return once("sexp", async function () {
   try {
     var base = document.getElementById("opt-base").value;
     var boxes = document.querySelectorAll(".opt-case:checked");
@@ -706,6 +786,7 @@ window.startExplore = async function (pid) {
       base_version_id: parseInt(base, 10), case_ids: ids } });
     location.hash = "#/run/" + r.run_id;
   } catch (e) { toast(e.message); }
+  });
 };
 window.quickAddCases = async function (pid) {
   var raw = document.getElementById("quick-cases").value.trim();
@@ -727,22 +808,39 @@ async function viewUse() {
       '先去 <a href="#/new">新建优化</a> 建一条。</div>';
     return;
   }
+  var first = d.options[0];
   var html = "<h1>用一用</h1>" +
     '<p class="sub">贴上今天的真实输入，用正在使用的版本出结果。用完点一下反馈，输入会自动存进例子池。</p>' +
-    '<div class="card"><label class="field"><span>用哪条提示词？</span><select id="use-prompt">';
+    '<div class="card"><label class="field"><span>用哪条提示词？</span><select id="use-prompt" onchange="viewUse()">';
   for (var i = 0; i < d.options.length; i++) {
     var o = d.options[i];
-    html += '<option value="' + o.id + '">' + esc(o.name) + "（当前用：" + esc(o.version_label) + "）</option>";
+    html += '<option value="' + o.id + '"' + (o.id === first.id ? " selected" : "") + ">" +
+      esc(o.name) + "</option>";
   }
-  html += "</select></label>" +
+  html += '</select></label>' +
+    '<label class="field"><span>用哪个版本？</span><select id="use-ver" onchange="changeUseVer()">' +
+    '<option value="auto"' + (first.use_pref === "auto" ? " selected" : "") + '>自动（正式版优先）</option>' +
+    '<option value="official"' + (first.use_pref === "official" ? " selected" : "") + '>固定用正式版</option>' +
+    '<option value="trial"' + (first.use_pref === "trial" ? " selected" : "") + '>固定用试用版</option>' +
+    "</select>" +
+    '<div class="hint">当前用的是：<b>' + esc(first.version_label) + "</b></div></label>" +
     '<label class="field"><span>今天的输入（原样贴进来）</span>' +
     '<textarea id="use-input" style="min-height:130px"></textarea></label>' +
-    '<div class="btn-row"><button class="btn primary big" onclick="doUse()">出结果（1 次调用）</button>' +
-    '<span class="muted small">想固定用「正式版」或「试用版」，到对应提示词页可改。</span></div>' +
+    '<div class="btn-row"><button class="btn primary big" onclick="doUse()">出结果（1 次调用）</button></div>' +
     '<div id="use-result"></div></div>';
   $app.innerHTML = html;
 }
-window.doUse = async function () {
+window.changeUseVer = async function () {
+  var pid = parseInt(document.getElementById("use-prompt").value, 10);
+  var pref = document.getElementById("use-ver").value;
+  try {
+    await api("/api/prompts/" + pid + "/use_pref", { body: { pref: pref } });
+    toast("已保存。");
+    viewUse();
+  } catch (e) { toast(e.message); }
+};
+window.doUse = function () {
+  return once("use", async function () {
   var pid = parseInt(document.getElementById("use-prompt").value, 10);
   var text = document.getElementById("use-input").value.trim();
   if (!text) { toast("先把输入贴进来。"); return; }
@@ -754,41 +852,52 @@ window.doUse = async function () {
     box.innerHTML = '<div class="field-label mt">结果（' + esc(r.version_label) + " · " + esc(r.cost_note) + "）：</div>" +
       '<div class="output-box">' + esc(r.output) + "</div>" +
       '<div class="btn-row"><button class="btn" onclick="copyText(window._use.output)">复制结果</button></div>' +
-      '<div class="field-label mt">这份结果你怎么用的？</div><div class="opt-row" data-role="fb">' +
-      '<button class="opt" onclick="pickOpt(this)" data-v="as_is">直接用了</button>' +
-      '<button class="opt" onclick="pickOpt(this)" data-v="edited">改了改</button>' +
-      '<button class="opt" onclick="pickOpt(this)" data-v="bad">没用上</button></div>' +
+      '<div id="fb-block"><div class="field-label mt">这份结果你怎么用的？</div><div class="opt-row" data-role="fb">' +
+      '<button class="opt" onclick="pickFb(this)" data-v="as_is">直接用了</button>' +
+      '<button class="opt" onclick="pickFb(this)" data-v="edited">改了改</button>' +
+      '<button class="opt" onclick="pickFb(this)" data-v="bad">没用上</button></div>' +
       '<div id="fb-extra"></div>' +
       '<div class="btn-row"><button class="btn primary" onclick="submitFeedback()">提交反馈</button>' +
-      '<label class="small"><input type="checkbox" id="fb-pool" checked> 同时把这条输入存进例子池</label></div>';
+      '<label class="small"><input type="checkbox" id="fb-pool" checked> 同时把这条输入存进例子池</label></div></div>';
   } catch (e) {
     box.innerHTML = '<div class="banner warn">' + esc(e.message) + "</div>";
+  }
+  });
+};
+window.pickFb = function (btn) {
+  pickOpt(btn);
+  var extra = document.getElementById("fb-extra");
+  if (!extra) return;
+  if (btn.getAttribute("data-v") === "edited") {
+    if (!extra.querySelector("textarea")) {
+      extra.innerHTML = '<label class="field mt"><span class="muted small">把你改后的文本贴进来（下次对比就有据可查）</span>' +
+        '<textarea id="fb-edited" style="min-height:70px"></textarea></label>';
+    }
+  } else {
+    extra.innerHTML = "";
   }
 };
 window.submitFeedback = async function () {
   var sel = document.querySelector('.opt-row[data-role="fb"] .opt.sel');
   if (!sel) { toast("先点一个反馈（直接用了/改了改/没用上）。"); return; }
   var v = sel.getAttribute("data-v");
-  var extra = document.getElementById("fb-extra");
   var edited = "";
   if (v === "edited") {
-    var ta = extra.querySelector("textarea");
-    if (!ta) {
-      extra.innerHTML = '<label class="field mt"><span class="muted small">把你改后的文本贴进来（下次对比就有据可查）</span>' +
-        '<textarea id="fb-edited"></textarea></label>';
-      toast("贴一下你改后的文本，再点提交。");
-      return;
-    }
+    var ta = document.getElementById("fb-edited");
+    if (!ta || !ta.value.trim()) { toast("选了「改了改」，把你改后的文本贴进来，方便下次对比。"); return; }
     edited = ta.value.trim();
-    if (!edited) { toast("改后文本还空着。"); return; }
   }
   try {
     var r = await api("/api/use/" + window._use.use_id + "/feedback", { body: {
       result: v, edited_text: edited || undefined,
       add_to_pool: document.getElementById("fb-pool").checked } });
-    toast(r.message);
+    var label = { as_is: "直接用了", edited: "改了改（改后文本已存档）", bad: "没用上" }[v];
+    var block = document.getElementById("fb-block");
+    block.innerHTML = '<div class="reveal mt">已记录：' + esc(label) + "。" +
+      (document.getElementById("fb-pool") && document.getElementById("fb-pool").checked
+        ? "这条输入已存进例子池，以后考个试可能会用到。" : "") + "</div>";
     document.getElementById("use-input").value = "";
-    document.getElementById("use-result").innerHTML = "";
+    toast(r.message);
   } catch (e) { toast(e.message); }
 };
 
@@ -822,7 +931,8 @@ async function viewExams() {
   }
   $app.innerHTML = html;
 }
-window.startExam = async function (pid, trialVid, officialVid, freshCount) {
+window.startExam = function (pid, trialVid, officialVid, freshCount) {
+  return once("sexam", async function () {
   try {
     if (freshCount < 15) {
       if (!window.confirm("现在没考过的新例子只有 " + freshCount + " 份（建议 20 份以上，至少 15 份）。\n份太少，考完了也只能说「还看不出来」。仍要现在考吗？")) return;
@@ -855,6 +965,7 @@ window.startExam = async function (pid, trialVid, officialVid, freshCount) {
       base_version_id: base, candidate_version_id: trialIdNum, case_ids: ids } });
     location.hash = "#/run/" + resp.run_id;
   } catch (e) { toast(e.message); }
+  });
 };
 
 /* ---------- 花费与记录 ---------- */
@@ -947,6 +1058,12 @@ window.testConn = async function () {
 };
 window.saveSettings = async function () {
   var keyVal = document.getElementById("st-key").value.trim();
+  var pi = document.getElementById("st-pi").value.trim();
+  var po = document.getElementById("st-po").value.trim();
+  if (window._capType === "money" && !pi && !po) {
+    toast("按金额上限需要先填单价（输入或输出至少填一个）；不知道单价就改回「按次数」。");
+    return;
+  }
   var body = {
     api_base: document.getElementById("st-base").value.trim(),
     api_key: keyVal || true,
@@ -955,8 +1072,8 @@ window.saveSettings = async function () {
     cap_value: window._capType === "money"
       ? (document.getElementById("st-cap-m").value || "5")
       : (document.getElementById("st-cap-r").value || "40"),
-    price_in: document.getElementById("st-pi").value,
-    price_out: document.getElementById("st-po").value
+    price_in: pi,
+    price_out: po
   };
   try {
     await api("/api/settings", { body: body });

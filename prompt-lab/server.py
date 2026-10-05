@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.environ.get("PROMPT_LAB_DATA") or os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "lab.db")
 
 DEFAULT_SETTINGS = {
@@ -506,6 +506,10 @@ def compute_verdict(conn, run):
                  % (base_usable, cand_usable, improved, regressed))
     if base_minor or cand_minor:
         lines.append("「改改能用」：原版 %d 份、新版 %d 份。" % (base_minor, cand_minor))
+    sel_total = len(json.loads(run["case_ids"] or "[]"))
+    missing = sel_total - len(pairs)
+    if missing > 0:
+        lines.append("另有 %d 条没比成（那边的输出没生成成功），不计入上面的结论。" % missing)
 
     def level():
         if n < 5:
@@ -555,7 +559,7 @@ def compute_verdict(conn, run):
         "tail": tail,
         "detail_lines": lines,
         "conclusion_level": lv,
-        "counts": {"judged": n, "pairs_total": len(pairs),
+        "counts": {"judged": n, "pairs_total": len(pairs), "missing": missing,
                    "cand_better": cand_better, "base_better": base_better,
                    "tie": tie, "unknown_pref": unknown_pref,
                    "base_usable": base_usable, "cand_usable": cand_usable,
@@ -711,6 +715,14 @@ def api_list_prompts(handler, m):
                                (r["id"],)).fetchone()["c"]
         n_usage = conn.execute("SELECT COUNT(*) c FROM usage_log WHERE prompt_id=?",
                                (r["id"],)).fetchone()["c"]
+        pending = conn.execute(
+            "SELECT kind, state FROM runs WHERE prompt_id=? AND state IN"
+            " ('ready','generating_base','rating_base','candidate_ready',"
+            " 'generating_candidate','comparing','paused_cap','stopping','failed')"
+            " ORDER BY id DESC", (r["id"],)).fetchall()
+        exams_done = conn.execute(
+            "SELECT COUNT(*) c FROM runs WHERE prompt_id=? AND kind='validate' AND state='done'",
+            (r["id"],)).fetchone()["c"]
         v_off = v_trial = None
         if r["official_version_id"]:
             v_off = conn.execute("SELECT version_no FROM versions WHERE id=?",
@@ -721,7 +733,9 @@ def api_list_prompts(handler, m):
         out.append({"id": r["id"], "name": r["name"], "note": r["note"],
                     "cases": n_cases, "usage": n_usage,
                     "official_v": v_off["version_no"] if v_off else None,
-                    "trial_v": v_trial["version_no"] if v_trial else None})
+                    "trial_v": v_trial["version_no"] if v_trial else None,
+                    "pending_runs": [dict(p) for p in pending],
+                    "exams_done": exams_done})
     conn.close()
     return {"ok": True, "prompts": out}
 
@@ -1337,6 +1351,8 @@ def api_exams(handler, m):
             "SELECT id, verdict FROM runs WHERE kind='validate' AND prompt_id=? AND state='done'"
             " ORDER BY id DESC LIMIT 1", (r["pid"],)).fetchone()
         out.append({"prompt_id": r["pid"], "name": r["name"],
+                    "trial_version_id": r["trial_version_id"],
+                    "official_version_id": r["official_version_id"],
                     "trial_v": r["trial_v"], "official_v": r["official_v"],
                     "validated": validated, "fresh_cases": fresh,
                     "last_run_id": last["id"] if last else None,
@@ -1368,7 +1384,8 @@ def api_use_options(handler, m):
     for r in rows:
         p = conn.execute("SELECT * FROM prompts WHERE id=?", (r["id"],)).fetchone()
         vid, vlabel = pick_use_version(conn, p)
-        out.append({"id": r["id"], "name": r["name"], "version_id": vid, "version_label": vlabel})
+        out.append({"id": r["id"], "name": r["name"], "version_id": vid,
+                    "version_label": vlabel, "use_pref": p["use_pref"]})
     conn.close()
     return {"ok": True, "options": out}
 

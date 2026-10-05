@@ -7,12 +7,68 @@
 用法：python tests/e2e_test.py
 """
 import json
+import os
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:8765"
+TEST_PORT = 8799
+MOCK_PORT = 8901
+BASE = "http://127.0.0.1:%d" % TEST_PORT
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.dirname(HERE)
+
+_server_proc = None
+_data_dir = None
+
+
+def _port_open(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), 0.2).close()
+        return True
+    except OSError:
+        return False
+
+
+def _start_services():
+    global _server_proc, _data_dir
+    if not _port_open(MOCK_PORT):
+        subprocess.Popen([sys.executable, os.path.join(HERE, "mock_llm.py"), str(MOCK_PORT)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        if _port_open(MOCK_PORT):
+            break
+        time.sleep(0.25)
+    _data_dir = tempfile.mkdtemp(prefix="prompt-lab-e2e-")
+    env = dict(os.environ, PROMPT_LAB_DATA=_data_dir)
+    _server_proc = subprocess.Popen(
+        [sys.executable, os.path.join(APP_DIR, "server.py"),
+         "--port", str(TEST_PORT), "--no-browser"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        if _port_open(TEST_PORT):
+            return
+        time.sleep(0.25)
+    raise SystemExit("隔离测试实例启动失败")
+
+
+def _stop_services():
+    global _server_proc, _data_dir
+    if _server_proc:
+        _server_proc.terminate()
+        try:
+            _server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _server_proc.kill()
+        _server_proc = None
+    if _data_dir:
+        shutil.rmtree(_data_dir, ignore_errors=True)
+        _data_dir = None
 PASSED = []
 FAILED = []
 
@@ -70,6 +126,14 @@ def judge_ratings(p):
 
 
 def main():
+    _start_services()
+    try:
+        _run_all()
+    finally:
+        _stop_services()
+
+
+def _run_all():
     # 0. 基础状态
     d = call("/api/state")
     check("服务可访问且初始未配置", d["ok"] is True and d["configured"] is False)
@@ -148,6 +212,11 @@ def main():
     check("存为试用版", d["ok"] is True)
     detail = call("/api/prompts/%d" % pid)
     check("试用指针已设置", detail["prompt"]["trial_version_id"] == cand_vid)
+    exams = call("/api/exams")["exams"]
+    exam_row = [e for e in exams if e["prompt_id"] == pid]
+    check("考试列表带试用版ID（前端启动考试依赖）",
+          exam_row and exam_row[0]["trial_version_id"] == cand_vid,
+          json.dumps(exams, ensure_ascii=False)[:200])
 
     # 7. 日常使用 + 反馈回流
     d = call("/api/use", {"prompt_id": pid, "input": "学生丁的答案：水 H2O"})
