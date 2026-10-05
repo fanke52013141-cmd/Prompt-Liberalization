@@ -41,7 +41,7 @@ def test_tc063_different_candidate_rejected_with_binding_info(client):
     # 另一个运行锁定不同候选（保留基线）再申请 → 拒绝并给出绑定报告
     run2 = start_run(client, s["pid"], s["prompt_id"], s["rubric_id"],
                      dev_ids=s["item_ids"][:6], max_candidates=0)
-    assert run2["state"] == "completed"
+    assert run2["state"] == "completed", run2.get("error")
     lk = client.post(f"/workflow-api/v1/runs/{run2['id']}/lock", json={"candidate_id": "baseline"})
     assert lk.status_code == 200
     rep3 = _accept(client, run2["id"])
@@ -62,7 +62,14 @@ def test_tc075_layered_decision_fields_present_and_consistent(client):
     assert rep["evidence_status"] in ("有效", "资料不足")
     assert rep["quality_decision"]
     gates = rep["gates"]
-    assert set(gates.keys()) == {"严重错误门槛", "样本充足门槛", "证据有效性"}
+    assert {"严重错误门槛", "样本充足门槛", "证据有效性", "评价器准入"} <= set(gates.keys())
+    assert gates["评价器准入"]["result"] in ("通过", "需人工复核")
+    # This fixture deliberately has no calibrated judge. Numerical scores
+    # cannot become a confirmed quality conclusion or adoption evidence.
+    assert gates["评价器准入"]["result"] == "需人工复核"
+    assert rep["evidence_status"] == "资料不足"
+    assert rep["decision"] == "evaluation_invalid"
+    assert "暂缓正式采用" in rep["eligibility"]
     # 一致性：结论与资格的映射（§17 决策顺序）
     if rep["decision"] == "verified_improvement" and gates["样本充足门槛"]["result"] == "通过":
         assert "可正式采用" in rep["eligibility"]

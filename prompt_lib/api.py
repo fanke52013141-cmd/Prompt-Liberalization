@@ -11,11 +11,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .core import BizError
+from .core import BizError, canonical_hash
 from .db import get_db
 from .domain import (AnnotationService, DataService, FeedbackService, JudgeService,
                      ProjectsService, PromptService, RatingService, RubricService)
 from .runs import AcceptanceService, ReleaseService, RunService
+from .ledger import Ledger
 
 API = "/workflow-api/v1"
 WEB_DIR = None  # 在 create_app 时设置
@@ -30,6 +31,11 @@ def create_app(web_dir: str) -> FastAPI:
     WEB_DIR = web_dir
     app = FastAPI(title="提示词优化实验室", version="0.1.0", docs_url=None, redoc_url=None)
     _seed()
+
+    @app.on_event('shutdown')
+    def drain_severity_audits():
+        from .severity_audits import SeverityAudits
+        SeverityAudits.drain_workers()
 
     @app.exception_handler(BizError)
     async def biz_handler(request: Request, exc: BizError):
@@ -378,12 +384,17 @@ def _routes(app: FastAPI):
                                   " ORDER BY version_no DESC", (project["id"],))
             if rubric:
                 text = get_db().one("SELECT text FROM outputs WHERE id=?", (gen["id"],))["text"]
-                out["evaluation"] = evaluate_once(text, rubric["id"], model_config, run_id)
+                full_item = DataService().get_item_full(body.item_id)
+                out["evaluation"] = evaluate_once(text, rubric["id"], model_config, run_id,
+                    task_input=item["runtime_input"], evaluation_reference=full_item["evaluation_only"])
         return out
 
     # ---------------- 输出与标注 P05/P06
     @app.get(API + "/outputs/{oid}")
     def output_get(oid: str):
+        from .human_acceptance import output_is_blinded
+        if output_is_blinded(get_db(), oid):
+            raise BizError('HUMAN_IDENTITY_BLINDED', '整批人工评审完成前，只能通过考试盲评视图查看此输出', status=409)
         r = get_db().one("SELECT * FROM outputs WHERE id=?", (oid,))
         if r is None:
             raise BizError("NOT_FOUND", "输出不存在", status=404)
@@ -399,9 +410,10 @@ def _routes(app: FastAPI):
             params.append(run_id)
         rows = get_db().query(f"SELECT * FROM outputs WHERE {cond} ORDER BY created_at DESC LIMIT ?",
                               tuple(params + [limit]))
+        from .human_acceptance import output_is_blinded
         return {"outputs": [{"id": r["id"], "item_id": r["item_id"],
                              "prompt_version_id": r["prompt_version_id"], "run_id": r["run_id"],
-                             "status": r["status"]} for r in rows]}
+                             "status": r["status"]} for r in rows if not output_is_blinded(get_db(), r['id'])]}
 
     class PairIn(BaseModel):
         left_output_id: str
@@ -432,6 +444,103 @@ def _routes(app: FastAPI):
     @app.post(API + "/annotations/{aid}/verify")
     def verify_annotation(aid: str):
         return AnnotationService().verify_annotation(aid)
+
+    @app.get(API + "/projects/{pid}/severity-gold/context")
+    def severity_gold_context(pid: str, output_id: str, rubric_id: str):
+        from .severity_gold import SeverityGold
+        return SeverityGold(get_db()).context(pid, output_id, rubric_id)
+
+    @app.post(API + "/projects/{pid}/severity-gold", status_code=201)
+    def severity_gold_submit(pid: str, body: dict):
+        from .severity_gold import SeverityGold
+        return SeverityGold(get_db()).submit(pid, body)
+
+    @app.get(API + "/projects/{pid}/severity-gold/{aid}/adjudication-context")
+    def severity_gold_adjudication_context(pid: str, aid: str):
+        from .severity_gold import SeverityGold
+        return SeverityGold(get_db()).adjudication_context(pid, aid)
+
+    @app.post(API + "/projects/{pid}/severity-gold/{aid}/adjudicate", status_code=201)
+    def severity_gold_adjudicate(pid: str, aid: str, body: dict):
+        from .severity_gold import SeverityGold
+        return SeverityGold(get_db()).adjudicate(pid, aid, body)
+
+    @app.post(API + "/judges/{jid}/severity-audit/validate")
+    def severity_audit_validate(jid: str, body: dict):
+        from .severity_gold import SeverityGold
+        manifest = SeverityGold(get_db()).audit_manifest(jid, body.get('build_gold_ids'), body.get('audit_gold_ids'))
+        return {'valid':True, 'snapshot':manifest, 'snapshot_hash':canonical_hash(manifest),
+                'note':'只检查金标及配置，不调用模型，不代表评价器已准入。'}
+
+    @app.post(API + "/judges/{jid}/severity-audits", status_code=201)
+    def severity_audit_create(jid: str, body: dict):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).create(jid, body)
+
+    @app.get(API + "/judges/{jid}/severity-audits")
+    def severity_audit_list(jid: str):
+        from .severity_audits import SeverityAudits
+        return {'tasks':SeverityAudits(get_db()).list(jid)}
+
+    @app.get(API + "/severity-audits/{aid}")
+    def severity_audit_get(aid: str):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).get(aid)
+
+    @app.post(API + "/severity-audits/{aid}/execute")
+    def severity_audit_execute(aid: str):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).execute(aid)
+
+    @app.post(API + "/severity-audits/{aid}/dispatch",status_code=202)
+    def severity_audit_dispatch(aid: str):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).dispatch(aid)
+
+    @app.post(API + "/severity-audits/{aid}/budget")
+    def severity_audit_budget(aid: str, body: dict):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).update_budget(aid,body)
+
+    @app.post(API + "/severity-audits/{aid}/cancel")
+    def severity_audit_cancel(aid: str, body: dict):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).cancel(aid,body)
+
+    @app.post(API + "/severity-audits/{aid}/verify-evidence")
+    def severity_audit_verify_evidence(aid: str):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).verify_evidence(aid)
+
+    @app.post(API + "/severity-audits/{aid}/activate")
+    def severity_audit_activate(aid: str, body: dict):
+        from .severity_audits import SeverityAudits
+        return SeverityAudits(get_db()).activate(aid,body)
+
+    @app.get(API + "/severity-audits/{aid}/ledger/attempts")
+    def severity_audit_attempts(aid: str):
+        severity_audit_get(aid)
+        return {'attempts':Ledger(get_db()).public_attempts(aid)}
+
+    @app.post(API + "/severity-audits/{aid}/ledger/{attempt_id}/reconcile-usage")
+    def severity_audit_reconcile_usage(aid: str, attempt_id: str, body: dict):
+        severity_audit_get(aid)
+        return Ledger(get_db()).reconcile_usage(aid,attempt_id,body)
+
+    @app.post(API + "/severity-audits/{aid}/ledger/{attempt_id}/reconcile-response")
+    def severity_audit_reconcile_response(aid: str, attempt_id: str, body: dict):
+        severity_audit_get(aid)
+        return Ledger(get_db()).reconcile_response(aid,attempt_id,body)
+
+    @app.post(API + "/severity-audits/{aid}/ledger/{attempt_id}/confirm-not-accepted")
+    def severity_audit_confirm_not_accepted(aid: str, attempt_id: str, body: dict):
+        severity_audit_get(aid)
+        return Ledger(get_db()).reconcile_not_accepted(aid,attempt_id,body)
+
+    @app.post(API + "/severity-audits/{aid}/ledger/{attempt_id}/authorize-retry")
+    def severity_audit_authorize_retry(aid: str, attempt_id: str, body: dict):
+        severity_audit_get(aid)
+        return Ledger(get_db()).authorize_retry(aid,attempt_id,body)
 
     # ---------------- 评价器 P07
     class JudgeIn(BaseModel):
@@ -494,6 +603,10 @@ def _routes(app: FastAPI):
         RunService().resume(rid)
         return RunService().get(rid)
 
+    @app.patch(API + "/runs/{rid}/budget")
+    def run_budget_update(rid: str, body: dict):
+        return RunService().update_budget(rid, body.get("limits"), body.get("revision"))
+
     class LockIn(BaseModel):
         candidate_id: str
 
@@ -505,11 +618,55 @@ def _routes(app: FastAPI):
     def run_ledger(rid: str):
         return RunService().ledger_view(rid)
 
+    @app.get(API + "/runs/{rid}/ledger/attempts")
+    def ledger_attempts(rid: str):
+        RunService().get(rid)
+        return {"attempts": Ledger(get_db()).public_attempts(rid)}
+
+    @app.post(API + "/runs/{rid}/ledger/{attempt_id}/reconcile-usage")
+    def reconcile_usage(rid: str, attempt_id: str, body: dict):
+        RunService().get(rid)
+        return Ledger(get_db()).reconcile_usage(rid, attempt_id, body)
+
+    @app.post(API + "/runs/{rid}/ledger/{attempt_id}/reconcile-response")
+    def reconcile_response(rid: str, attempt_id: str, body: dict):
+        RunService().get(rid)
+        return Ledger(get_db()).reconcile_response(rid, attempt_id, body)
+
+    @app.post(API + "/runs/{rid}/ledger/{attempt_id}/confirm-not-accepted")
+    def confirm_not_accepted(rid: str, attempt_id: str, body: dict):
+        RunService().get(rid)
+        return Ledger(get_db()).reconcile_not_accepted(rid, attempt_id, body)
+
+    @app.post(API + "/runs/{rid}/ledger/{attempt_id}/authorize-retry")
+    def authorize_retry(rid: str, attempt_id: str, body: dict):
+        RunService().get(rid)
+        return Ledger(get_db()).authorize_retry(rid, attempt_id, body)
+
     @app.get(API + "/projects/{pid}/runs")
     def runs_list(pid: str):
         return {"runs": RunService().list(pid)}
 
     # ---------------- 验收与报告 P12
+    @app.get(API + "/runs/{rid}/acceptance-job")
+    def acceptance_job(rid: str):
+        RunService().get(rid)
+        return {"job": AcceptanceService().job(rid)}
+
+    @app.post(API + "/runs/{rid}/acceptance-job/cancel")
+    def acceptance_cancel(rid: str):
+        return {"job": AcceptanceService().cancel(rid)}
+
+    @app.get(API + "/runs/{rid}/acceptance-review")
+    def acceptance_review(rid: str):
+        from .human_acceptance import HumanAcceptance
+        return HumanAcceptance(get_db()).view(rid)
+
+    @app.post(API + "/runs/{rid}/acceptance-review/{public_id}/{side}")
+    def acceptance_rate(rid: str, public_id: str, side: str, body: dict):
+        from .human_acceptance import HumanAcceptance
+        return HumanAcceptance(get_db()).submit(rid, public_id, side, body)
+
     @app.post(API + "/runs/{rid}/accept", status_code=202)
     def run_accept(rid: str):
         return AcceptanceService().accept(rid)

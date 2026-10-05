@@ -1,5 +1,6 @@
 """发布指针/试用边界/回滚/反馈/归档（TC003/TC048/TC049/TC050）。"""
 import json
+import pytest
 import sys
 from pathlib import Path
 
@@ -8,17 +9,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conftest import make_project
 
 
+@pytest.fixture(autouse=True)
+def isolate_severity_gate_for_release_pointer_tests(monkeypatch):
+    # These tests exercise release pointers/configuration. Real audit evidence
+    # is exercised by test_severity_audit_execution and human_acceptance.
+    monkeypatch.setattr('prompt_lib.judge_binding.severe_admitted_for',lambda *args:True)
+
+
 def _insert_report(pid, prompt_id, decision):
     """直接构造验收报告行（完整验收流程由e2e覆盖）。"""
-    from prompt_lib.core import new_id, now_iso
+    from prompt_lib.core import canonical_hash, new_id, now_iso
+    from prompt_lib.domain import PromptService
     from prompt_lib.db import get_db
     rid = new_id("rep")
+    run_id = new_id("run_fixture")
+    from prompt_lib.domain import JudgeService
+    from prompt_lib.judge_binding import evaluator_binding
+    rubric=get_db().one("SELECT id FROM rubrics WHERE project_id=? AND status='published'",(pid,))
+    config={'connection_id':'conn_mock','model':'mock-gen-1'}
+    judge=JudgeService(get_db()).create(pid,rubric['id'],config)
+    binding=evaluator_binding(get_db(),rubric['id'],config)
+    get_db().execute("UPDATE judges SET status='audited',metrics_json=? WHERE id=?",(
+        json.dumps({'admission':{'eligible':True},'evaluator_binding':binding}),judge['id']))
+    snapshot = {"models": {"generation": {"connection_id": "conn_mock", "model": "mock-gen-1",
+                "connection_snapshot": {"id": "conn_mock", "provider": "mock", "model": "mock-gen-1"}}}}
+    snapshot['rubric_id']=rubric['id']
+    snapshot['models']['evaluation']=config
+    get_db().execute("INSERT INTO runs(id,project_id,snapshot_json,snapshot_hash,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                     (run_id, pid, json.dumps(snapshot), canonical_hash(snapshot), now_iso(), now_iso()))
     get_db().execute(
         "INSERT INTO acceptance_reports(id,run_id,project_id,candidate_ref,baseline_ref,"
-        "test_manifest_json,policy_json,stats_json,decision,consumed,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?, '1', ?)",
-        (rid, "run_seed", pid, prompt_id, "pv_base", "{}", "{}",
-         json.dumps({"diff": 0.2}), decision, now_iso()))
+        "test_manifest_json,policy_json,stats_json,decision,consumed,created_at,"
+        "candidate_hash,policy_hash,evidence_status,gates_json,eligibility)"
+        " VALUES(?,?,?,?,?,?,?,?,?, '1', ?,?,?,?,?,?)",
+        (rid, run_id, pid, prompt_id, "pv_base", "{}", "{}",
+         json.dumps({"diff": 0.2,'evaluator_evidence':{'source':'model','judge_id':judge['id'],'binding':binding}}), decision, now_iso(),
+         PromptService(get_db()).get(prompt_id)["hash"], canonical_hash({}), "有效",
+         json.dumps({"严重错误门槛": {"result": "通过"},
+                     "评价器准入": {"result": "通过"},
+                     "样本充足门槛": {"result": "通过"},
+                     "证据有效性": {"result": "有效"}}, ensure_ascii=False), "可正式采用"))
     return rid
 
 
@@ -41,6 +71,118 @@ def test_active_requires_verified_report(client):
                     json={"prompt_version_id": pv1, "mode": "trial"})
     assert r.status_code == 201
     assert client.get(f"/workflow-api/v1/projects/{pid}/releases").json()["current"] is None
+
+
+def test_active_uses_verified_configuration_and_rejects_missing_execution(client):
+    from prompt_lib.db import get_db
+    s = _setup(client)
+    report = _insert_report(s["pid"], s["prompt_id"], "verified_improvement")
+    result = client.post(f"/workflow-api/v1/projects/{s['pid']}/releases", json={
+        "prompt_version_id": s["prompt_id"], "report_ref": report, "mode": "active",
+        "model_config": {"connection_id": "different", "model": "unverified-model"}})
+    assert result.status_code == 201, result.text
+    assert result.json()["model_config"]["model"] == "mock-gen-1"
+    run_id = get_db().one("SELECT run_id FROM acceptance_reports WHERE id=?", (report,))["run_id"]
+    get_db().execute("DELETE FROM runs WHERE id=?", (run_id,))
+    result = client.post(f"/workflow-api/v1/projects/{s['pid']}/releases", json={
+        "prompt_version_id": s["prompt_id"], "report_ref": report, "mode": "active"})
+    assert result.status_code == 422
+    assert result.json()["code"] == "REPORT_EXECUTION_MISSING"
+
+
+def test_model_report_without_live_calibration_cannot_be_published(client):
+    from prompt_lib.db import get_db
+    s=_setup(client)
+    report=_insert_report(s['pid'],s['prompt_id'],'verified_improvement')
+    db=get_db()
+    db.execute('UPDATE acceptance_reports SET stats_json=? WHERE id=?',
+        (json.dumps({'evaluator_evidence':{'source':'model','judge_id':'missing','binding':{'hash':'old'}}}),report))
+    response=client.post(f"/workflow-api/v1/projects/{s['pid']}/releases",json={
+        'prompt_version_id':s['prompt_id'],'report_ref':report,'mode':'active'})
+    assert response.status_code==409,response.text
+    assert response.json()['code']=='CALIBRATION_CONTEXT_CHANGED'
+    assert db.one('SELECT COUNT(*) FROM releases')[0]==0
+
+
+def test_legacy_report_without_evaluation_source_requires_new_acceptance(client):
+    from prompt_lib.db import get_db
+    s=_setup(client)
+    report=_insert_report(s['pid'],s['prompt_id'],'verified_improvement')
+    get_db().execute("UPDATE acceptance_reports SET stats_json='{}' WHERE id=?",(report,))
+    response=client.post(f"/workflow-api/v1/projects/{s['pid']}/releases",json={
+        'prompt_version_id':s['prompt_id'],'report_ref':report,'mode':'active'})
+    assert response.status_code==422,response.text
+    assert response.json()['code']=='REPORT_EVALUATOR_MISSING'
+    assert get_db().one('SELECT COUNT(*) FROM releases')[0]==0
+
+
+def test_failed_new_release_insert_preserves_previous_active_pointer(client):
+    from prompt_lib.db import get_db
+    s=_setup(client)
+    report=_insert_report(s['pid'],s['prompt_id'],'verified_improvement')
+    endpoint=f"/workflow-api/v1/projects/{s['pid']}/releases"
+    first=client.post(endpoint,json={'prompt_version_id':s['prompt_id'],'report_ref':report,'mode':'active'})
+    assert first.status_code==201,first.text
+    db=get_db()
+    db.execute("CREATE TRIGGER fail_release_insert BEFORE INSERT ON releases BEGIN SELECT RAISE(ABORT,'fixture release failure'); END")
+    import sqlite3
+    from prompt_lib.runs import ReleaseService
+    with pytest.raises(sqlite3.IntegrityError):
+        ReleaseService(db).adopt(s['pid'],s['prompt_id'],report)
+    assert ReleaseService(db).current(s['pid'])['id']==first.json()['id']
+    assert db.one('SELECT COUNT(*) FROM releases')[0]==1
+
+
+def test_release_validation_excludes_concurrent_database_writer(client,monkeypatch):
+    import sqlite3
+    from prompt_lib.db import get_db
+    from prompt_lib.domain import PromptService
+    s=_setup(client)
+    report=_insert_report(s['pid'],s['prompt_id'],'verified_improvement')
+    db=get_db()
+    original=PromptService.get
+    attempts=[]
+    def checked(service,version_id):
+        other=sqlite3.connect(str(db.path),timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError,match='locked'):
+                other.execute("UPDATE acceptance_reports SET decision='no_improvement' WHERE id=?",(report,))
+            attempts.append(True)
+        finally:
+            other.close()
+        return original(service,version_id)
+    monkeypatch.setattr(PromptService,'get',checked)
+    result=client.post(f"/workflow-api/v1/projects/{s['pid']}/releases",json={
+        'prompt_version_id':s['prompt_id'],'report_ref':report,'mode':'active'})
+    assert result.status_code==201,result.text
+    assert attempts==[True]
+
+
+@pytest.mark.parametrize('failure',['status','audit'])
+def test_rollback_failure_restores_all_release_state(client,failure):
+    import sqlite3
+    from prompt_lib.db import get_db
+    from prompt_lib.runs import ReleaseService
+    s=_setup(client)
+    db=get_db()
+    service=ReleaseService(db)
+    first=service.adopt(s['pid'],s['prompt_id'],_insert_report(s['pid'],s['prompt_id'],'verified_improvement'))
+    second=service.adopt(s['pid'],s['prompt2_id'],_insert_report(s['pid'],s['prompt2_id'],'verified_improvement'))
+    before=service.history(s['pid'])
+    if failure=='status':
+        db.execute("CREATE TRIGGER fail_rollback BEFORE UPDATE OF status ON releases WHEN NEW.status='rolled_back' BEGIN SELECT RAISE(ABORT,'fixture rollback failure'); END")
+    else:
+        db.execute("CREATE TRIGGER fail_rollback BEFORE INSERT ON audit_log WHEN NEW.action='release.rollback' BEGIN SELECT RAISE(ABORT,'fixture rollback failure'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        service.rollback(second['id'],first['id'])
+    assert service.history(s['pid'])==before
+    assert service.current(s['pid'])['id']==second['id']
+    assert db.one("SELECT COUNT(*) FROM audit_log WHERE action='release.rollback'")[0]==0
+    db.execute('DROP TRIGGER fail_rollback')
+    restored=service.rollback(second['id'],first['id'])
+    assert restored['prompt_version_id']==first['prompt_version_id']
+    assert service.get(second['id'])['status']=='rolled_back'
+    assert db.one("SELECT COUNT(*) FROM audit_log WHERE action='release.rollback'")[0]==1
 
 
 def test_concurrent_adopt_revision_conflict_and_rollback(client):
@@ -86,6 +228,24 @@ def test_feedback_validation_and_pending_pool(client):
     assert bad.status_code == 422
     fl = client.get(f"/workflow-api/v1/projects/{pid}/feedback").json()["feedback"]
     assert fl[0]["adoption"] == "abandoned"
+
+
+def test_rollback_cannot_upgrade_trial_or_reuse_invalid_report(client):
+    from prompt_lib.db import get_db
+    s = _setup(client)
+    pid = s["pid"]
+    report = _insert_report(pid, s["prompt_id"], "verified_improvement")
+    current = client.post(f"/workflow-api/v1/projects/{pid}/releases", json={
+        "prompt_version_id": s["prompt_id"], "report_ref": report, "mode": "active"}).json()
+    trial = client.post(f"/workflow-api/v1/projects/{pid}/releases", json={
+        "prompt_version_id": s["prompt2_id"], "mode": "trial"}).json()
+    result = client.post(f"/workflow-api/v1/releases/{current['id']}/rollback", json={"target_release_id": trial["id"]})
+    assert result.status_code == 422
+    assert result.json()["code"] == "REPORT_NOT_VERIFIED"
+    get_db().execute("UPDATE acceptance_reports SET candidate_hash='tampered' WHERE id=?", (report,))
+    result = client.post(f"/workflow-api/v1/releases/{current['id']}/rollback", json={"target_release_id": current["id"]})
+    assert result.status_code == 422
+    assert client.get(f"/workflow-api/v1/projects/{pid}/releases").json()["current"]["id"] == current["id"]
 
 
 def test_archived_project_rejects_new_paid_run(client):

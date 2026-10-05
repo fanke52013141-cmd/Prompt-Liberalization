@@ -1,0 +1,2 @@
+# Optional extension only. Base application does not import GEPA at startup.
+gepa==0.1.4

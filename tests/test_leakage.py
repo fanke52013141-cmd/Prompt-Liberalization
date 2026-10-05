@@ -30,8 +30,8 @@ def test_same_source_group_across_splits_blocked(client):
     assert "g001" in json.dumps(body["field_errors"], ensure_ascii=False)
 
 
-def test_evaluation_only_never_in_outbound(client, monkeypatch):
-    """TC009：截获全部出站请求确认 evaluation_only 哨兵绝不出现。"""
+def test_reference_is_never_sent_to_generation_but_available_to_evaluation(client, monkeypatch):
+    """TC009：参考不得进入被测生成请求；授权评价拥有完整参考上下文。"""
     import prompt_lib.engine as engine
     from prompt_lib.providers import CallResult
     pid = make_project(client)["id"]
@@ -44,6 +44,8 @@ def test_evaluation_only_never_in_outbound(client, monkeypatch):
     pv = client.post(f"/workflow-api/v1/projects/{pid}/prompts", json={
         "name": "基线", "body": "点评：{{question}} {{student_answer}}",
         "variables": ["question", "student_answer", "grade_level"]}).json()
+    rubric = client.post(f"/workflow-api/v1/projects/{pid}/rubrics").json()
+    assert client.post(f"/workflow-api/v1/rubrics/{rubric['id']}/publish").status_code == 200
     captured = []
 
     class Recorder:
@@ -58,9 +60,11 @@ def test_evaluation_only_never_in_outbound(client, monkeypatch):
     r = client.post(f"/workflow-api/v1/prompts/{pv['id']}/trial",
                     json={"item_id": dev_ids[0]})
     assert r.status_code == 200, r.text
-    blob = json.dumps(captured, ensure_ascii=False)
+    blob = json.dumps([c for c in captured if c["role"] == "generation"], ensure_ascii=False)
     assert SENTINEL not in blob, "evaluation_only 字段泄漏到出站请求"
     assert "expert_answer" not in blob
+    evaluation = json.dumps([c for c in captured if c["role"] == "evaluation"], ensure_ascii=False)
+    assert SENTINEL in evaluation
     # 输出表也不含哨兵
     outs = client.get(f"/workflow-api/v1/projects/{pid}/outputs").json()
     assert len(outs["outputs"]) >= 1

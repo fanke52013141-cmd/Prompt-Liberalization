@@ -111,7 +111,7 @@ def wait_run(client, rid, timeout=60):
     t0 = time.time()
     while time.time() - t0 < timeout:
         run = client.get(f"/workflow-api/v1/runs/{rid}").json()
-        if run["state"] in ("completed", "failed", "cancelled", "paused_budget"):
+        if run["state"] in ("completed", "failed", "cancelled", "paused_budget", "paused_interrupted"):
             return run
         time.sleep(0.2)
     raise TimeoutError(f"run {rid} not settled: {run['state']}")

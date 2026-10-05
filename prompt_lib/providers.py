@@ -140,9 +140,10 @@ def is_usable(scored: dict) -> bool:
     return (sum(vals) / len(vals)) >= 2.0
 
 
-def has_severe_error(output_text: str, scored: dict) -> bool:
-    """严重错误＝虚构/纠正为错误结论（severity_examples），由输出标记识别。"""
-    return _SEVERE_MARKER in output_text
+def has_severe_error(output_text: str, scored: dict) -> bool | None:
+    """Real evaluation uses structured evidence; unavailable severity stays unknown."""
+    value = scored.get("severe")
+    return value if type(value) is bool else None
 
 
 # ---------------------------------------------------------------- Providers
@@ -195,12 +196,13 @@ class MockProvider:
                                   ensure_ascii=False)
                 usage = {"in": 150 + len(flat) // 2, "out": 40 + len(body) // 2}
                 return CallResult(body, "stop", usage)
-            dims = re.findall(r"维度[：:]\s*([^\n]+)", flat)
+            dims = re.findall(r"^维度[：:][ \t]*([^\n]+)", flat, re.MULTILINE)
             dims = [d.strip() for d in dims if d.strip()]
             text_payload = re.search(r"<output>([\s\S]*?)</output>", flat)
             output_text = text_payload.group(1) if text_payload else flat[-400:]
             scored = judge_score_output(output_text, dims or ["判断正确"])
             body = json.dumps({"scores": scored["scores"], "abstain": scored["abstain"],
+                               "severe": _SEVERE_MARKER in output_text,
                                "reason": "模拟评价器按输出特征打分（演示）"},
                               ensure_ascii=False)
             if inject == "bad_json":
@@ -254,6 +256,7 @@ class OpenAICompatProvider:
     name = "openai_compat"
 
     def __init__(self, config: dict):
+        self.config = dict(config)
         self.base_url = (config.get("base_url") or "").rstrip("/")
         self.api_key = config.get("api_key") or ""
         if not self.base_url:
@@ -292,12 +295,23 @@ class OpenAICompatProvider:
                                 http_status=e.code)
         except urllib.error.URLError as e:
             raise ProviderError("NETWORK", f"网络错误：{e.reason}", retryable=True)
-        choice = data.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        usage = data.get("usage", {}) or {}
-        return CallResult(msg.get("content") or "", choice.get("finish_reason") or "stop",
-                          {"in": usage.get("prompt_tokens", 0),
-                           "out": usage.get("completion_tokens", 0)}, raw=data)
+        except (TimeoutError, OSError) as e:
+            raise ProviderError("NETWORK", "请求结果不明：连接中断或超时", retryable=True) from e
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ProviderError("INVALID_RESPONSE", "响应不是有效JSON，调用结果与用量需核对") from e
+        if (not isinstance(data, dict) or not isinstance(data.get("choices"), list)
+                or not data["choices"] or not isinstance(data["choices"][0], dict)):
+            raise ProviderError("INVALID_RESPONSE", "响应缺少有效choices，调用结果与用量需核对")
+        choice = data["choices"][0]
+        msg = choice.get("message")
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), str):
+            raise ProviderError("INVALID_RESPONSE", "响应缺少文本输出，调用结果与用量需核对")
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        return CallResult(msg["content"], choice.get("finish_reason") or "unknown",
+                          {"in": usage.get("prompt_tokens"),
+                           "out": usage.get("completion_tokens")}, raw=data)
 
 
 def get_provider(connection: dict):

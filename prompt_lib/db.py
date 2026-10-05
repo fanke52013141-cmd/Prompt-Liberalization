@@ -9,7 +9,11 @@ import json
 import os
 import sqlite3
 import threading
+from datetime import datetime, timezone
+from pathlib import Path
+import uuid
 from contextlib import contextmanager
+from prompt_core.migrations import add_column, apply_migrations, sql
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "data", "prompt_lab.db")
@@ -251,11 +255,62 @@ class DB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            existing = self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='projects'").fetchone()
+            migrations = self._conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'").fetchone()
+            required = ("main_001_legacy_columns", "main_002_money_reservations", "main_003_call_receipts", "main_004_acceptance_jobs", "main_005_acceptance_state", "main_006_usage_reconciliation", "main_007_response_reconciliation", "main_008_retry_authorization", "main_009_human_acceptance", "main_010_severity_audits", "main_011_severity_gold_arbitration")
+            current = migrations and self._conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (" + ",".join("?" for _ in required) + ")",
+                required).fetchone()[0] == len(required)
+            if existing and not current:
+                from prompt_core.backup import backup_database, verify_backup
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+                folder = Path(self.path).parent / "backups" / ("main-upgrade-" + stamp + "-" + uuid.uuid4().hex[:8])
+                try:
+                    verify_backup(backup_database(self.path, folder))
+                except Exception:
+                    self._conn.close()
+                    raise
             self._conn.executescript(_SCHEMA)
-            for table, col, ddl in _MIGRATIONS:
-                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
-                if col not in cols:
-                    self._conn.execute(ddl)
+            apply_migrations(self._conn, [("main_001_legacy_columns", tuple(
+                add_column(table, col, ddl.split(" ADD COLUMN " + col + " ", 1)[1])
+                for table, col, ddl in _MIGRATIONS)),
+                ("main_002_money_reservations", (
+                    add_column("ledger", "reserved_amount", "TEXT NOT NULL DEFAULT '0'"),
+                    add_column("ledger", "price_json", "TEXT NOT NULL DEFAULT '{}'"),
+                )), ("main_003_call_receipts", (
+                    add_column("ledger", "response_json", "TEXT NOT NULL DEFAULT ''"),
+                )), ("main_004_acceptance_jobs", (
+                    sql("CREATE TABLE acceptance_jobs (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), "
+                        "project_id TEXT NOT NULL REFERENCES projects(id), candidate_ref TEXT NOT NULL, "
+                        "binding_json TEXT NOT NULL, manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL, "
+                        "contract_json TEXT NOT NULL, artifact_total INTEGER NOT NULL, "
+                        "report_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
+                        "UNIQUE(run_id,candidate_ref))"),
+                )), ("main_005_acceptance_state", (
+                    add_column("acceptance_jobs", "state", "TEXT NOT NULL DEFAULT 'bound'"),
+                    add_column("acceptance_jobs", "error", "TEXT NOT NULL DEFAULT ''"),
+                    add_column("acceptance_jobs", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+                    sql("UPDATE acceptance_jobs SET state='completed' WHERE report_id<>''"),
+                )), ("main_006_usage_reconciliation", (
+                    add_column("ledger", "resolution_json", "TEXT NOT NULL DEFAULT ''"),
+                )), ("main_007_response_reconciliation", (
+                    add_column("ledger", "response_resolution_json", "TEXT NOT NULL DEFAULT ''"),
+                )), ("main_008_retry_authorization", (
+                    add_column("ledger", "retry_authorization_json", "TEXT NOT NULL DEFAULT ''"),
+                    add_column("ledger", "retry_consumed", "INTEGER NOT NULL DEFAULT 0"),
+                )), ("main_009_human_acceptance", (
+                    add_column("acceptance_jobs", "review_json", "TEXT NOT NULL DEFAULT '{}'"),
+                    add_column("acceptance_jobs", "rubric_json", "TEXT NOT NULL DEFAULT '{}'"),
+                )), ("main_010_severity_audits", (
+                    sql("CREATE TABLE severity_audits (id TEXT PRIMARY KEY, judge_id TEXT NOT NULL REFERENCES judges(id), "
+                        "project_id TEXT NOT NULL REFERENCES projects(id), snapshot_json TEXT NOT NULL, snapshot_hash TEXT NOT NULL, "
+                        "budget_state_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'bound', error TEXT NOT NULL DEFAULT '', "
+                        "metrics_json TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0, "
+                        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(judge_id,snapshot_hash))"),
+                )), ("main_011_severity_gold_arbitration", (
+                    add_column("annotations", "supersedes_id", "TEXT NOT NULL DEFAULT ''"),
+                    sql("CREATE INDEX IF NOT EXISTS annotations_supersedes ON annotations(supersedes_id)"),
+                ))])
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.commit()
 

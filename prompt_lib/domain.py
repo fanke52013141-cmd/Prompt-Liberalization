@@ -122,6 +122,9 @@ class ProjectsService:
         batch_ids = [r["id"] for r in
                      self.db.query("SELECT id FROM import_batches WHERE project_id=?", (pid,))]
         with self.db.tx() as conn:
+            conn.execute('DELETE FROM ledger WHERE run_id IN (SELECT id FROM severity_audits WHERE project_id=?)', (pid,))
+            conn.execute('DELETE FROM severity_audits WHERE project_id=?', (pid,))
+            conn.execute('DELETE FROM acceptance_jobs WHERE project_id=?', (pid,))
             for run in conn.execute(
                     "SELECT id FROM runs WHERE project_id=?", (pid,)).fetchall():
                 for t in ("ledger", "run_events", "run_rounds"):
@@ -618,6 +621,7 @@ class DataService:
                         "access_state,created_at) VALUES(?,?,?,?, 'sealed', ?)",
                         (r["id"], pid,
                          json.dumps({"runtime_input": jloads(r["runtime_input_json"], {}),
+                                     "source_group_id": r["source_group_id"],
                                      "evaluation_only": jloads(r["evaluation_only_json"], {})},
                                     ensure_ascii=False),
                          r["content_hash"], now_iso()))
@@ -657,6 +661,10 @@ class DataService:
         with self.db.tx() as conn:
             for r in rows:
                 payload = json.loads(r["sealed_json"])
+                if not payload.get("source_group_id"):
+                    legacy = conn.execute("SELECT source_group_id FROM dataset_items WHERE id=?",
+                                          (r["item_id"],)).fetchone()
+                    payload["source_group_id"] = legacy[0] if legacy else None
                 out.append({"item_id": r["item_id"], "sha256": r["sha256"], **payload})
                 conn.execute("UPDATE sealed_artifacts SET access_state='consumed' WHERE item_id=?",
                              (r["item_id"],))
@@ -865,7 +873,10 @@ class AnnotationService:
     def create_pair(self, pid: str, left_output_id: str, right_output_id: str,
                     purpose: str) -> dict:
         self._project(pid)
+        from .human_acceptance import output_is_blinded
         for oid in (left_output_id, right_output_id):
+            if output_is_blinded(self.db, oid):
+                raise BizError('HUMAN_IDENTITY_BLINDED', '考试输出须在整批评审完成后才能用于普通对比', status=409)
             if self.db.one("SELECT 1 FROM outputs WHERE id=?", (oid,)) is None:
                 raise BizError("NOT_FOUND", f"输出不存在：{oid}", status=404)
         pub = "pair_" + new_id("x")[2:12]
@@ -971,9 +982,12 @@ class AnnotationService:
     def list_annotations(self, pid: str, gold_only: bool = False) -> list[dict]:
         cond = "project_id=?" + (" AND gold_status IN ('human_verified','adjudicated')" if gold_only else "")
         rows = self.db.query(f"SELECT * FROM annotations WHERE {cond}", (pid,))
+        superseded = {r['supersedes_id'] for r in self.db.query(
+            "SELECT supersedes_id FROM annotations WHERE project_id=? AND supersedes_id<>''", (pid,))}
         return [{"id": r["id"], "output_id": r["output_id"], "rubric_id": r["rubric_id"],
                  "source": r["source"], "gold_status": r["gold_status"],
-                 "payload": jloads(r["scores_json"], {}), "purpose": r["purpose"]} for r in rows]
+                 "payload": jloads(r["scores_json"], {}), "purpose": r["purpose"],
+                 "supersedes_id": r["supersedes_id"], "superseded": r["id"] in superseded} for r in rows]
 
     def _published_rubric(self, pid: str) -> dict:
         r = self.db.one("SELECT * FROM rubrics WHERE project_id=? AND status='published'"
@@ -1000,6 +1014,26 @@ class JudgeService:
 
     def create(self, pid: str, rubric_id: str, model_config: dict) -> dict:
         self._project(pid)
+        rubric=self.db.one("SELECT schema_json FROM rubrics WHERE id=? AND project_id=? AND status='published'",(rubric_id,pid))
+        if not rubric:
+            raise BizError('RUBRIC_NOT_PUBLISHED','评价器须绑定本项目已发布标准',status=422)
+        if not isinstance(model_config,dict):
+            raise BizError('MODEL_CONFIG_INVALID','模型配置须为对象',status=422)
+        if 'calibration_policy' in model_config:
+            from prompt_core.calibration import calibration_decision
+            result=calibration_decision({'n':0,'per_dim':{}},model_config['calibration_policy'])
+            if any(reason in ('POLICY_NOT_FROZEN','POLICY_INVALID') for reason in result['reasons']):
+                raise BizError('CALIBRATION_POLICY_INVALID','评分准入门槛缺失、类型或范围无效',status=422)
+        if 'severity_calibration_policy' in model_config:
+            from prompt_core.evaluation import severity_rules
+            from prompt_core.severity_calibration import audit_severity
+            try:
+                rules=list(severity_rules(json.loads(rubric['schema_json'])))
+            except ValueError as exc:
+                raise BizError('SEVERITY_SCHEMA_INVALID',str(exc),status=422) from exc
+            result=audit_severity([],rules,model_config['severity_calibration_policy'],build_sources=[])
+            if not result['per_rule']:
+                raise BizError('SEVERITY_POLICY_INVALID','严重准入门槛或规则无效：'+','.join(result['reasons']),status=422)
         row = self.db.one("SELECT COALESCE(MAX(version_no),0)+1 AS n FROM judges WHERE project_id=?",
                           (pid,))
         h = canonical_hash({"rubric": rubric_id, "model_config": model_config})
@@ -1044,11 +1078,26 @@ class JudgeService:
         schema = json.loads(rubric["schema_json"])
         dims = [d["name"] for d in schema.get("dimensions", [])]
 
+        for oid in build_refs + audit_refs:
+            if self.db.one("SELECT 1 FROM annotations WHERE output_id=? AND gold_status IN "
+                           "('human_verified','adjudicated') AND source!='human_severity'", (oid,)) is None:
+                raise BizError("GOLD_NOT_VERIFIED", "校准输出必须先有人工核验的金标", status=422)
+
         def group_of(oid: str) -> str:
             row = self.db.one(
                 "SELECT i.source_group_id AS g FROM outputs o JOIN dataset_items i ON i.id=o.item_id"
                 " WHERE o.id=?", (oid,))
-            return row["g"] if row else f"__output_{oid}"
+            if row is None or not row["g"]:
+                raise BizError("AUDIT_SOURCE_MISSING", "校准输出必须绑定有来源的任务输入", status=422)
+            owner = self.db.one("SELECT project_id FROM outputs WHERE id=?", (oid,))
+            if owner["project_id"] != judge["project_id"]:
+                raise BizError("AUDIT_PROJECT_MISMATCH", "校准输出必须属于评价器的项目", status=422)
+            return row["g"]
+
+        for refs in (build_refs, audit_refs):
+            groups = list(map(group_of, refs))
+            if len(set(groups)) != len(groups):
+                raise BizError("AUDIT_DUPLICATE_SOURCE", "首版校准每个来源只能选一个输出，避免重复计算支持量", status=422)
 
         overlap = sorted(set(map(group_of, build_refs)) & set(map(group_of, audit_refs)))
         if overlap:
@@ -1061,10 +1110,12 @@ class JudgeService:
             for oid in refs:
                 ann = self.db.one(
                     "SELECT * FROM annotations WHERE output_id=? AND gold_status IN"
-                    " ('human_verified','adjudicated') ORDER BY created_at DESC", (oid,))
+                    " ('human_verified','adjudicated') AND source!='human_severity' ORDER BY created_at DESC", (oid,))
                 if ann is None:
                     raise BizError("GOLD_NOT_VERIFIED",
                                    f"输出 {oid} 没有人工核验的gold标注；模型预标注不能作为gold（TC020）")
+                if ann["rubric_id"] != rubric["id"] or ann["project_id"] != judge["project_id"]:
+                    raise BizError("GOLD_CONTEXT_MISMATCH", "人工金标必须与当前评价标准及项目一致", status=422)
                 out.append({"output_id": oid,
                             "human": jloads(ann["scores_json"], {}).get("scores", {}),
                             "text": self.db.one("SELECT text FROM outputs WHERE id=?",
@@ -1073,16 +1124,35 @@ class JudgeService:
 
         build = collect(build_refs)
         audit = collect(audit_refs)
-        model_config = judge["model_config"]
+        from .judge_binding import freeze_evaluator, evaluator_binding
+        model_config = freeze_evaluator(judge["model_config"])
+        binding = evaluator_binding(self.db, rubric["id"], model_config)
         metrics = {"build": self._score_set(build, dims, model_config, rubric["id"], run_id),
                    "audit": self._score_set(audit, dims, model_config, rubric["id"], run_id)}
         low_support = metrics["audit"]["n"] < 5
         metrics["limits"] = {"low_support": low_support,
                              "note": "审计样本不足5条时不能声称全面可靠（TC022）" if low_support else ""}
-        self.db.execute("UPDATE judges SET build_refs_json=?, audit_refs_json=?, metrics_json=?,"
-                        " status='audited' WHERE id=?",
-                        (json.dumps(build_refs), json.dumps(audit_refs),
-                         json.dumps(metrics, ensure_ascii=False), jid))
+        from prompt_core.calibration import calibration_decision
+        metrics["admission"] = calibration_decision(metrics["audit"], model_config.get("calibration_policy"))
+        if evaluator_binding(self.db, rubric["id"], model_config) != binding:
+            raise BizError("CALIBRATION_CONTEXT_CHANGED", "校准期间评价标准或执行配置发生变化，请重新校准", status=409)
+        metrics["evaluator_binding"] = binding
+        metrics["executed_model_config"] = model_config
+        with self.db.tx() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            current=conn.execute('SELECT * FROM judges WHERE id=?',(jid,)).fetchone()
+            if (not current or current['rubric_id']!=rubric['id'] or
+                    evaluator_binding(self.db,rubric['id'],jloads(current['model_config_json'],{}))!=binding):
+                raise BizError('CALIBRATION_CONTEXT_CHANGED','校准期间当前模型配置或标准发生变化，不保存旧校准',status=409)
+            previous=jloads(current['metrics_json'],{})
+            if previous.get('severity_audit'):
+                metrics['severity_audit']=previous['severity_audit']
+                # Keep the historical reference; explicit activation rechecks
+                # live severity evidence against the new score calibration.
+                metrics['severity_reactivation_required']=True
+            conn.execute("UPDATE judges SET build_refs_json=?, audit_refs_json=?, metrics_json=?,"
+                         " status='audited' WHERE id=?",
+                         (json.dumps(build_refs),json.dumps(audit_refs),json.dumps(metrics,ensure_ascii=False),jid))
         return self.get(jid)
 
     def _score_set(self, rows: list[dict], dims: list[str], model_config: dict,
@@ -1090,10 +1160,14 @@ class JudgeService:
         from .engine import evaluate_once
         per_dim = {d: {"n": 0, "exact": 0, "within1": 0, "abstain": 0,
                        "confusion": [[0] * 4 for _ in range(4)],
-                       "severe_support": 0, "severe_recall": None} for d in dims}
+                       "zero_score_support": 0, "zero_score_recall": None} for d in dims}
         n = len(rows)
         for row in rows:
-            scored = evaluate_once(row["text"], rubric_id, model_config, run_id=run_id)
+            out = self.db.one("SELECT item_id FROM outputs WHERE id=?", (row["output_id"],))
+            context = DataService(self.db).get_item_full(out["item_id"]) if out else {}
+            scored = evaluate_once(row["text"], rubric_id, model_config, run_id=run_id,
+                                   task_input=context.get("runtime_input", {}),
+                                   evaluation_reference=context.get("evaluation_only", {}))
             if scored.get("abstain"):
                 for d in dims:
                     per_dim[d]["abstain"] += 1
@@ -1101,7 +1175,7 @@ class JudgeService:
             for d in dims:
                 h = row["human"].get(d)
                 m = scored["scores"].get(d)
-                if isinstance(h, int) and isinstance(m, int):
+                if type(h) is int and type(m) is int and 0 <= h <= 3 and 0 <= m <= 3:
                     pd = per_dim[d]
                     pd["n"] += 1
                     if h == m:
@@ -1110,17 +1184,17 @@ class JudgeService:
                         pd["within1"] += 1
                     pd["confusion"][min(h, 3)][min(m, 3)] += 1
                     if h == 0:
-                        pd["severe_support"] += 1
+                        pd["zero_score_support"] += 1
                         if m == 0:
-                            pd["severe_recall"] = (pd["severe_recall"] or 0) + 1
+                            pd["zero_score_recall"] = (pd["zero_score_recall"] or 0) + 1
         for d, pd in per_dim.items():
             if pd["n"]:
                 pd["exact_rate"] = round(pd["exact"] / pd["n"], 4)
                 pd["within1_rate"] = round(pd["within1"] / pd["n"], 4)
-                if pd["severe_support"]:
-                    pd["severe_recall"] = round((pd["severe_recall"] or 0) / pd["severe_support"], 4)
+                if pd["zero_score_support"]:
+                    pd["zero_score_recall"] = round((pd["zero_score_recall"] or 0) / pd["zero_score_support"], 4)
                 else:
-                    pd["severe_recall"] = None  # 无正例：召回不可估，不声称高召回（TC022）
+                    pd["zero_score_recall"] = None  # 0分识别统计不是严重问题召回。
         return {"n": n, "per_dim": per_dim}
 
 

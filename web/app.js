@@ -172,6 +172,8 @@ async function route() {
   const h = location.hash || "#/projects";
   let m = h.match(/^#\/proj\/([^/]+)\/run\/([^/]+)$/);
   if (m) { state.pid = m[1]; await pageRunDetail(m[2]); renderNav(); return; }
+  m = h.match(/^#\/proj\/([^/]+)\/review\/([^/]+)$/);
+  if (m) { state.pid = m[1]; await pageHumanExam(m[2]); renderNav(); return; }
   m = h.match(/^#\/proj\/([^/]+)\/([^/]+)$/);
   if (m) { state.pid = m[1]; await pageProject(m[2]); }
   else if (h === "#/settings") { state.pid = null; await pageSettingsGlobal(); }
@@ -868,7 +870,7 @@ async function confirmReview(item, rule, rating) {
 /* ---------------- 第三步：原始测评（§7） ---------------- */
 function isBaselineRun(r) {
   const o = (r.snapshot && r.snapshot.optimization) || {};
-  return !parseInt(o.max_rounds || o.max_candidates || 0);
+  return o.strategy !== "gepa" && parseInt(o.max_rounds || o.max_candidates || 0) === 0;
 }
 PAGES.baseline = async (p) => {
   const prog = await getProgress(p.id);
@@ -951,13 +953,22 @@ async function startRunCommon(opt) {
     devIds = (await api("GET", `/projects/${state.pid}/items?split=dev&size=100`)).items.map(i => i.id);
   }
   if (!devIds.length) { throw new Error("需要先导入案例并分配到开发集（dev）"); }
+  let selectIds = [];
+  const selectionControl = document.getElementById("op-selection");
+  if (selectionControl && selectionControl.value === "required") {
+    const selection = await api("GET", `/projects/${state.pid}/items?split=select&size=100`);
+    selectIds = selection.items.map(i => i.id);
+    if (!selectIds.length) throw new Error("请先在案例页准备独立选择案例；选择案例不参与改写，仅用于决定保留候选。");
+    if (selection.total > selectIds.length) throw new Error("选择案例超过当前界面可加载数量，请在实验配置中明确指定完整选择列表。");
+  }
   const draft = {
     mode: "explore", prompt: { baseline_id: baseline }, rubric_id: rubric, judge_id: null,
     manifest_id: (mans.manifests[0] || {}).id || "",
-    data: { dev_item_ids: devIds, select_item_ids: [] },
+    data: { dev_item_ids: devIds, select_item_ids: selectIds },
     models: { generation: { connection_id: "conn_mock" }, evaluation: { connection_id: "conn_mock" },
               optimizer: { connection_id: "conn_mock" } },
     optimization: opt,
+    acceptance: { evaluation_source: document.getElementById("op-final-eval")?.value || "model" },
     budget: { mode: "token", total_limit: 2_000_000, search_limit: 1_200_000, acceptance_limit: 600_000 },
   };
   const r = await api("POST", `/projects/${state.pid}/runs`, draft,
@@ -991,8 +1002,18 @@ PAGES.optimize = async (p) => {
       <div><label>最小改善阈值</label><input id="op-delta" type="number" step="0.01" value="0.05"></div>
       <div><label>提示词长度上限（字）</label><input id="op-len" type="number" value="4000"></div>
       <div><label>开发集抽样</label><input id="op-sample" type="number" value="8"></div>
+      <div><label>搜索策略</label><select id="op-strategy" onchange="updateOptimizationStrategy()">
+        <option value="reflection">反思式逐轮优化</option>
+        <option value="single">单次反思改写</option>
+        <option value="gepa">GEPA 前沿搜索（可选扩展）</option></select>
+        <p class="muted small">GEPA只优化提示词正文，须安装锁定版本并准备独立select案例；安装说明见 README。</p></div>
+      <div><label>GEPA评价调用上限（每个案例一次生成+评价）</label><input id="op-gepa-calls" type="number" min="1" max="10000" value="40" disabled></div>
+      <div><label>候选选择依据</label><select id="op-selection"><option value="required">独立选择案例（推荐）</option><option value="explore">仅开发案例探索，结果只供参考</option></select>
+      <p class="muted small">选择案例按运行前的固定列表比较，不进入改写证据。选择表现用于搜索取舍，最终仍须新的封存考题验证。</p></div>
       <div><label>人工参与模式</label><select id="op-human"><option value="">自动连续执行</option>
-        <option value="1">每轮等待人工评价</option></select></div>
+        <option value="1">每轮等待人工评价</option></select><p class="muted small">GEPA目前连续搜索；预算暂停和主动停止仍可用。</p></div>
+      <div><label>独立考试的最终评价</label><select id="op-final-eval"><option value="human">人工逐侧盲评</option><option value="model">模型评价（须独立校准）</option></select>
+      <p class="muted small">运行启动前冻结。人工分别判断两侧是否可用及严重错误，不靠偏好代替质量；提交后不可修改。</p></div>
     </div>
     <div style="margin-top:10px"><button onclick="startOptimizeRun()">启动自动优化</button>
     <span class="muted small">内置演示供应商不花钱；预算已设上限：token 总额 200 万（搜索 120 万 + 独立验证预留 60 万，
@@ -1002,8 +1023,11 @@ PAGES.optimize = async (p) => {
 };
 async function startOptimizeRun() {
   try {
+    const strategy = document.getElementById("op-strategy").value;
     const r = await startRunCommon({
-      max_rounds: +document.getElementById("op-rounds").value || 3,
+      strategy,
+      max_rounds: strategy === "single" ? 1 : (+document.getElementById("op-rounds").value || 3),
+      gepa_max_metric_calls: +document.getElementById("op-gepa-calls").value || 40,
       stall_rounds: +document.getElementById("op-stall").value || 2,
       min_delta: +document.getElementById("op-delta").value || 0.05,
       length_limit_chars: +document.getElementById("op-len").value || 4000,
@@ -1014,19 +1038,37 @@ async function startOptimizeRun() {
     location.hash = `#/proj/${state.pid}/run/${r.id}`;
   } catch (e) { toast(errText(e), true); }
 }
+function updateOptimizationStrategy() {
+  const strategy = document.getElementById("op-strategy").value;
+  const rounds = document.getElementById("op-rounds");
+  rounds.disabled = strategy === "single" || strategy === "gepa";
+  if (strategy === "single") rounds.value = "1";
+  if (strategy === "reflection") rounds.value = "3";
+  const selection = document.getElementById("op-selection");
+  if (strategy === "gepa") selection.value = "required";
+  selection.disabled = strategy === "gepa";
+  document.getElementById("op-gepa-calls").disabled = strategy !== "gepa";
+  const human = document.getElementById("op-human");
+  human.disabled = strategy === "gepa";
+  if (strategy === "gepa") human.value = "";
+}
 function runStateLabel(s) {
   return { queued: "排队", running: "运行中", waiting_human: "等待人工参与", paused_budget: "预算暂停",
+    paused_interrupted: "已暂停，待核对或恢复",
     stopping: "停止中", completed: "已完成", failed: "失败", cancelled: "已取消" }[s] || s;
 }
 function runStopLabel(s) {
   return { candidate_found: "发现保留候选", no_improvement: "无提升（保留基线）", stalled_no_gain: "连续无改善",
     rewrite_stalled: "改写连续失败", target_reached: "达到目标", budget_exhausted: "预算耗尽",
-    user_cancelled: "主动停止" }[s] || (s || "-");
+    gepa_candidate_found: "GEPA搜索找到通过门槛的候选",
+    user_cancelled: "主动停止", service_interrupted: "服务中断，待恢复", call_result_unconfirmed: "调用结果未知，待核对" }[s] || (s || "-");
 }
 async function renderRunList(p) {
   const runs = await api("GET", `/projects/${p.id}/runs`);
   const rows = runs.runs.map(r => {
-    const kind = isBaselineRun(r) ? pill("原始测评", "brand") : pill("自动优化", "");
+    const strategy = (r.snapshot?.optimization || {}).strategy;
+    const kind = isBaselineRun(r) ? pill("原始测评", "brand") :
+      pill(strategy === "gepa" ? "GEPA搜索" : strategy === "single" ? "单次反思" : "反思式优化", "");
     const kept = (r.candidates || []).filter(c => c.decision === "kept").length;
     return `<tr><td class="small"><a href="#/proj/${p.id}/run/${r.id}">${esc(r.id)}</a></td>
     <td>${kind}</td><td>${pill(runStateLabel(r.state), r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}</td>
@@ -1047,16 +1089,25 @@ PAGES.runs = async (p) => renderRunList(p);
 /* ---------------- 运行详情（独立可恢复路由 §8.4/§12） ---------------- */
 let _pollTimer = null;
 let _stateTimer = null;
+function budgetUnit(b) {
+  return b.mode === "money" ? (Object.values(b.prices || {})[0]?.currency || "金额") : "token";
+}
 function fmtLedger(b) {
   const s = (b.spent || {}), r = (b.reserved || {});
   const sum = o => Object.values(o).reduce((a, x) => a + (Number(x) || 0), 0);
-  return `已用 ${sum(s).toLocaleString()}（搜索 ${Number(s.search || 0).toLocaleString()} + 验收 ${Number(s.acceptance || 0).toLocaleString()}）· ` +
-    `在途预留 ${sum(r).toLocaleString()}（额度内预估，完成后结算）`;
+  const unit = budgetUnit(b);
+  const fmt = value => Number(value || 0).toLocaleString(undefined,
+    b.mode === "money" ? { maximumSignificantDigits: 12 } : { maximumFractionDigits: 0 });
+  return `已用${b.mode === "money" ? "费用估算" : "用量"} ${fmt(sum(s))} ${esc(unit)}（搜索 ${fmt(s.search)} + 验收 ${fmt(s.acceptance)}）· ` +
+    `预留 ${fmt(sum(r))} ${esc(unit)}（包含在途与费用未知调用）`;
 }
 async function pageRunDetail(rid) {
   clearInterval(_pollTimer); clearInterval(_stateTimer);
   const [r] = await Promise.all([api("GET", `/runs/${rid}`)]);
-  const live = ["running", "waiting_human", "paused_budget", "stopping", "queued"].includes(r.state);
+  const strategy = (r.snapshot?.optimization || {}).strategy || "reflection";
+  const strategyLabel = strategy === "gepa" ? "GEPA前沿搜索" :
+    strategy === "single" ? "单次反思改写" : "反思式逐轮优化";
+  const live = ["running", "waiting_human", "paused_budget", "paused_interrupted", "stopping", "queued"].includes(r.state);
   const kept = (r.candidates || []).filter(c => c.decision === "kept");
   const canLock = r.state === "completed" && !r.locked_candidate;
   const candRows = (r.candidates || []).map(c => `
@@ -1067,7 +1118,8 @@ async function pageRunDetail(rid) {
     <td>${c.usable_rate != null ? (c.usable_rate * 100).toFixed(0) + "%" : ""}</td>
     <td class="small">${c.regressions || 0} 回退 / ${c.severe || 0} 严重 / ${c.fixed_problems ? c.fixed_problems.length : 0} 修复</td>
     <td class="small">${c.length || ""} 字</td>
-    <td class="small" style="white-space:normal">${esc(c.rationale || "")}</td>
+    <td class="small" style="white-space:normal">${esc(c.rationale || "")}
+      ${c.selection && c.selection.item_ids ? `<div class="muted small">固定选择案例 ${c.selection.item_ids.length} 条：${Number(c.selection.baseline_score).toFixed(3)} → ${Number(c.selection.candidate_score).toFixed(3)}；${c.selection.passed ? "通过选择检查" : "未通过选择检查"}。这是搜索证据，尚需独立考试。</div>` : ""}</td>
     <td>${canLock && (c.decision === "kept" || c.decision === "retained_alt")
       ? `<button onclick="lockCand('${r.id}','${c.candidate_id}')">锁定为待验证</button>` : ""}</td></tr>`).join("");
   const roundCards = (r.rounds || []).map(rd => `
@@ -1089,17 +1141,25 @@ async function pageRunDetail(rid) {
     <h1>运行 ${esc(r.id)}</h1>
     <p class="sub">${pill(runStateLabel(r.state), r.state === "completed" ? "ok" : r.state === "failed" ? "bad" : "warn")}
     停止原因：${esc(runStopLabel(r.stop_reason))} ·
-    ${isBaselineRun(r) ? "原始测评" : "自动优化"} · 阶段 ${esc(r.stage || "-")}</p></div>
+    ${isBaselineRun(r) ? "原始测评" : strategyLabel} · 阶段 ${esc(r.stage || "-")}</p></div>
     <div style="flex:0"><a class="small" href="#/proj/${state.pid}/optimize">← 返回运行列表</a></div></div>
-  ${r.state === "running" ? `<div class="card"><p class="muted small">正在优化：第 ${r.round_no + 1} 轮。
-    正在检查：原问题是否减少；其他判断是否退步；评分是否仍符合标准。未完成全部轮数前不显示完成百分比。
+  ${r.state === "running" ? `<div class="card"><p class="muted small">正在执行${strategyLabel}${strategy === "gepa" ? `（评价调用上限 ${esc(r.snapshot.optimization.gepa_max_metric_calls || 40)}）` : `：第 ${r.round_no + 1} 轮`}。
+    正在检查：原问题是否减少；其他判断是否退步；评分是否仍符合标准。未完成前不显示完成百分比。
     <b>运行结束后本页会自动刷新，无需手动操作。</b></p></div>` : ""}
   ${r.state === "waiting_human" ? `<div class="card focus"><b>等待人工参与</b>
     <p class="muted small">本轮已完成，等待指定评价。离开页面不影响运行；确认评价后点击继续。</p>
     <button onclick="continueRun('${r.id}')">继续优化 →</button></div>` : ""}
   ${r.state === "paused_budget" ? `<div class="card"><b>预算暂停</b>
-    <p class="muted small">搜索预算已用完；独立验证的预留额度没有被占用。已完成的输出全部保留，可调整预算后恢复运行。</p>
-    <button onclick="resumeRun('${r.id}')">恢复运行</button></div>` : ""}
+    <p class="muted small">剩余额度不足以预留下一次调用。已完成输出和费用未知预留保留；明确增加额度后恢复，价格及模型配置保持冻结。</p>
+    <div class="flex">
+      <div><label for="rb-total">新总额度（${esc(budgetUnit(r.budget))}）</label><input id="rb-total" type="number" min="0" step="${r.budget.mode === 'money' ? 'any' : '1'}" value="${esc(r.budget.total_limit)}"></div>
+      <div><label for="rb-search">新搜索额度</label><input id="rb-search" type="number" min="0" step="${r.budget.mode === 'money' ? 'any' : '1'}" value="${esc(r.budget.search_limit)}"></div>
+      <div><label for="rb-accept">验收预留</label><input id="rb-accept" type="number" min="0" step="${r.budget.mode === 'money' ? 'any' : '1'}" value="${esc(r.budget.acceptance_limit)}"></div>
+    </div>
+    <button onclick="saveBudgetAndResume('${r.id}',${r.revision})">保存新额度并恢复</button></div>` : ""}
+  ${r.state === "paused_interrupted" ? `<div class="card"><b>${r.stop_reason === 'call_result_unconfirmed' ? '调用结果未知，等待核对' : '服务中断后等待恢复'}</b>
+    <p class="muted small">已保存的输出和候选保留。恢复会读取已确认结果；未确认旧调用需先核对，不会自动重发。</p>
+    <button onclick="resumeInterruptedRun('${r.id}')">继续已保存的运行</button></div>` : ""}
   <div class="card">
     <b>基线与候选对比（不只比较平均分）</b>
     <div class="stat-hero">
@@ -1111,7 +1171,7 @@ async function pageRunDetail(rid) {
         <span class="head-pill ${r.locked_candidate ? "ok" : ""}">${r.locked_candidate ? "已锁定" : "未锁定"}</span></div>
         <div class="v">${r.locked_candidate ? esc(r.locked_candidate) : canLock ? "尚未选择" : "未锁定"}</div>
         <div class="sub2">${r.locked_candidate ? "可去「验证与使用」做最终检验" : canLock ? "在下方锁定一个候选，或保留原版" : "完成运行后可锁定"}</div></div>
-      <div class="stat"><div class="k">账本用量 <span class="head-pill ok">本地计费</span></div>
+      <div class="stat"><div class="k">账本用量 <span class="head-pill">本地记录</span></div>
         <div class="v small" style="font-size:13px;white-space:normal">${fmtLedger(r.budget)}</div></div>
     </div>
     ${(r.candidates || []).length ? `<table class="cand-table" style="margin-top:8px"><tr><th>候选</th><th>决定</th><th>平均分</th><th>可用率</th><th>底线检查</th><th>长度</th><th>依据</th><th></th></tr>${candRows}</table>`
@@ -1125,7 +1185,9 @@ async function pageRunDetail(rid) {
       <details class="small"><summary>事件流与日志（默认折叠）</summary><pre id="ev-out" class="small">加载中…</pre></details>
     </div>
   </div>
-  ${roundCards || ""}`);
+  ${roundCards || ""}
+  ${acceptanceTaskCard(r)}
+  ${await usageReconciliationCard(rid)}`);
   pollEvents(rid, 0);
   if (r.state === "running") _pollTimer = setInterval(() => pollEvents(rid, window._evCursor || 0), 2500);
   if (live) {
@@ -1142,6 +1204,74 @@ async function pageRunDetail(rid) {
     }, 2500);
   }
 }
+async function usageReconciliationCard(rid, namespace = 'runs') {
+  const result = await api("GET", `/${namespace}/${rid}/ledger/attempts`);
+  const unknown = result.attempts.filter(row => ['usage_unknown', 'sent_unknown'].includes(row.status));
+  if (!unknown.length) return '';
+  return `<div class="card"><b>补录已核实的调用用量</b>
+    <p class="small muted">请核对供应商记录后填写输入和输出token。响应丢失时还须补回原始文本与结束原因；系统按调用时冻结单价计算费用估算。</p>
+    ${unknown.map(row => `<details><summary>${esc(row.attempt_id)} · ${esc(row.role)} · ${esc(row.model)}</summary>
+      <p class="small muted">原请求指纹：${esc(row.request_hash)}</p>
+      ${row.status === 'sent_unknown' ? `<p class="small">响应尚未确认，当前仍保留潜在费用。</p>
+      <label>核实的原始响应文本</label><textarea id="usage-${row.attempt_id}-text"></textarea>
+      <label>供应商结束原因</label><select id="usage-${row.attempt_id}-finish"><option value="">请选择已核实的原因</option><option value="stop">正常结束（stop）</option><option value="length">截断（length）</option></select>
+      <label><input id="usage-${row.attempt_id}-unknown" type="checkbox">用量尚未核实：只补回响应，保留费用预留</label>` : ''}
+      <div class="flex"><div><label>实际输入token</label><input id="usage-${row.attempt_id}-in" type="number" min="0" step="1"></div>
+      <div><label>实际输出token</label><input id="usage-${row.attempt_id}-out" type="number" min="0" step="1"></div></div>
+      <label>核对原因</label><input id="usage-${row.attempt_id}-reason">
+      <label>供应商记录依据</label><textarea id="usage-${row.attempt_id}-evidence"></textarea>
+      ${row.status === 'sent_unknown' ? `<label><input id="usage-${row.attempt_id}-notaccepted" type="checkbox">供应商已明确确认未受理且无费用（仅超时不能勾选）</label>
+      <button class="secondary" onclick="confirmNotAccepted('${rid}','${row.attempt_id}','${row.request_hash}','${namespace}')">确认未受理，释放原预留</button>` : ''}
+      ${row.status === 'sent_unknown' && !row.retry_authorization_json ? `<label><input id="usage-${row.attempt_id}-retry" type="checkbox">接受可能重复计费，授权一次新尝试；旧预留继续保留</label>
+      <button class="secondary" onclick="authorizeRetry('${rid}','${row.attempt_id}','${row.request_hash}','${namespace}')">授权一次新尝试（保留旧预留）</button>` : row.retry_authorization_json ? `<p class="small muted">本请求已有一次新尝试授权（${row.retry_consumed ? '已使用' : '待使用'}），旧潜在费用仍保留。</p>` : ''}
+      <button onclick="reconcileUsage('${rid}','${row.attempt_id}','${row.request_hash}',${row.status === 'sent_unknown'},'${namespace}')">${row.status === 'sent_unknown' ? '保存核实响应与用量' : '保存核实用量'}</button></details>`).join('')}</div>`;
+}
+
+async function reconcileUsage(rid, attemptId, requestHash, recoverResponse = false, namespace = 'runs') {
+  try {
+    const input = document.getElementById(`usage-${attemptId}-in`).value.trim();
+    const output = document.getElementById(`usage-${attemptId}-out`).value.trim();
+    const usageUnknown = recoverResponse && document.getElementById(`usage-${attemptId}-unknown`).checked;
+    if (!usageUnknown && (!/^\d+$/.test(input) || !/^\d+$/.test(output) || !Number.isSafeInteger(Number(input)) || !Number.isSafeInteger(Number(output)))) {
+      toast('请填写非负整数输入与输出token', true); return;
+    }
+    const body = {
+      request_hash: requestHash, actual_in: usageUnknown ? null : Number(input), actual_out: usageUnknown ? null : Number(output),
+      reason: document.getElementById(`usage-${attemptId}-reason`).value,
+      evidence: document.getElementById(`usage-${attemptId}-evidence`).value};
+    if (recoverResponse) {
+      body.text = document.getElementById(`usage-${attemptId}-text`).value;
+      body.finish = document.getElementById(`usage-${attemptId}-finish`).value;
+      body.usage_known = !usageUnknown;
+    }
+    await api('POST', `/${namespace}/${rid}/ledger/${attemptId}/${recoverResponse ? 'reconcile-response' : 'reconcile-usage'}`, body);
+    toast(usageUnknown ? '已补回响应，用量未知，费用预留继续保留' : '已保存核实用量，费用按冻结价格计算');
+    if (namespace === 'runs') await pageRunDetail(rid); else await route();
+  } catch (e) { toast(errText(e), true); }
+}
+
+async function confirmNotAccepted(rid, attemptId, requestHash, namespace = 'runs') {
+  try {
+    await api('POST', `/${namespace}/${rid}/ledger/${attemptId}/confirm-not-accepted`, {
+      request_hash: requestHash, confirmed_not_accepted: document.getElementById(`usage-${attemptId}-notaccepted`).checked,
+      reason: document.getElementById(`usage-${attemptId}-reason`).value,
+      evidence: document.getElementById(`usage-${attemptId}-evidence`).value});
+    toast('已释放原请求预留；恢复运行时新尝试仍须重新预留');
+    if (namespace === 'runs') await pageRunDetail(rid); else await route();
+  } catch (e) { toast(errText(e), true); }
+}
+
+async function authorizeRetry(rid, attemptId, requestHash, namespace = 'runs') {
+  try {
+    await api('POST', `/${namespace}/${rid}/ledger/${attemptId}/authorize-retry`, {
+      request_hash: requestHash, confirmed_possible_duplicate: document.getElementById(`usage-${attemptId}-retry`).checked,
+      reason: document.getElementById(`usage-${attemptId}-reason`).value,
+      evidence: document.getElementById(`usage-${attemptId}-evidence`).value});
+    toast('已记录一次新尝试授权；继续运行时重新预留，旧潜在费用保留');
+    if (namespace === 'runs') await pageRunDetail(rid); else await route();
+  } catch (e) { toast(errText(e), true); }
+}
+
 async function pollEvents(rid, cursor) {
   try {
     const r = await api("GET", `/runs/${rid}/events?cursor=${cursor}`);
@@ -1157,7 +1287,20 @@ async function continueRun(rid) {
   await api("POST", `/runs/${rid}/continue`); toast("已继续优化");
   pageRunDetail(rid);
 }
-async function resumeRun(rid) { await api("POST", `/runs/${rid}/resume`); pageRunDetail(rid); }
+async function saveBudgetAndResume(rid, revision) {
+  try {
+    await api("PATCH", `/runs/${rid}/budget`, {revision, limits: {
+      total_limit: document.getElementById("rb-total").value.trim(),
+      search_limit: document.getElementById("rb-search").value.trim(),
+      acceptance_limit: document.getElementById("rb-accept").value.trim()}});
+    await api("POST", `/runs/${rid}/resume`);
+    await pageRunDetail(rid);
+  } catch (e) { toast(errText(e), true); }
+}
+async function resumeInterruptedRun(rid) {
+  try { await api("POST", `/runs/${rid}/resume`); await pageRunDetail(rid); }
+  catch (e) { toast(errText(e), true); }
+}
 async function lockCand(rid, cid) {
   try {
     await api("POST", `/runs/${rid}/lock`, { candidate_id: cid });
@@ -1179,6 +1322,22 @@ function decisionPill(d) {
   const [label, cls] = map[d] || [d, ""];
   return pill(label, cls);
 }
+function acceptanceTaskCard(r) {
+  const job = r.acceptance_job;
+  if (!job || job.state === "completed") return "";
+  const paused = ["paused_budget", "paused_interrupted", "bound"].includes(job.state);
+  const unit = budgetUnit(r.budget);
+  const fields = [["total_limit", "总额度"], ["search_limit", "搜索额度"], ["acceptance_limit", "验收额度"]];
+  return `<div class="card"><b>考试任务 ${esc(job.id)}</b>
+    <p class="small">${esc(({waiting_human:"整批输出已准备，等待人工盲评", running:"正在验证", cancelling:"正在停止，等待当前调用返回", cancelled:"已停止，考题暴露记录保留", paused_budget:"预算不足，已暂停", paused_interrupted:"已中断，可继续", bound:"已绑定，待继续"})[job.state] || job.state)} · ${job.case_count} 个来源配对</p>
+    ${job.state === 'waiting_human' ? `<a href="#/proj/${state.pid}/review/${r.id}"><button>进入人工最终盲评</button></a>` : ''}
+    ${job.error ? `<p class="small muted">${esc(job.error)}</p>` : ""}
+    <p class="small muted">${job.state === 'cancelled' ? '已停止考试不能重新启动；这些考题仍不能作为新候选的独立证明。' : '继续同一考试会保留考题绑定并复用已保存结果。'}</p>
+    ${paused || ['running','waiting_human'].includes(job.state) ? `<button class="secondary" onclick="cancelExam('${r.id}')">停止这场考试</button>` : ''}
+    ${job.state === "paused_budget" ? `<div class="flex">${fields.map(([key,label]) => `<div><label>${label}（${esc(unit)}）</label><input id="exam-${r.id}-${key}" type="number" min="0" step="${r.budget.mode === 'money' ? 'any' : '1'}" value="${esc(r.budget[key])}"></div>`).join("")}</div>
+    <button onclick="increaseExamBudget('${r.id}',${r.revision})">增加额度并继续考试</button>` : paused ? `<button onclick="continueExam('${r.id}')">继续同一考试</button>` : ""}</div>`;
+}
+
 PAGES.verify = async (p) => {
   const prog = await getProgress(p.id);
   const [runs, reps, mans] = await Promise.all([
@@ -1217,13 +1376,14 @@ PAGES.verify = async (p) => {
       <div class="legend-chip"><span class="dot2" style="background:var(--muted)"></span><span><b>评价无效</b><small>评分过程出错，结论不可信</small></span></div>
     </div>
     ${done.length ? "" : `<p class="small muted" style="margin-top:4px">还没有可验证的运行：先在「自动优化」里完成一次运行，并在运行详情中锁定待验证版本（或保留原版）。</p>`}
-    ${sealedN ? `<div class="tip"><b>人工投入估算：</b>当前封存考题 ${sealedN} 组，最终盲评约需 ${sealedN} × 2 分钟 ≈ <b>${sealedN * 2} 分钟</b>（按“一对约2分钟”的演示口径；实际以试标中位耗时为准，不要按“条”误算）。</div>` : ""}
+    ${sealedN ? `<div class="tip"><b>人工投入估算：</b>当前封存考题 ${sealedN} 组；本系统尚无实测人工评审工时。先对 3–5 组试标计时，再用实测中位耗时估算整批工作量，不把演示数字当承诺。</div>` : ""}
   </div>
   <div class="card">
     <b>验证报告</b>
     ${reps.reports.length ? `<table><tr><th>报告</th><th>结论</th><th>配对差异</th><th>规模</th><th>时间</th></tr>${repRows}</table>`
       : `<p class="muted small">尚无报告。注意：优化样例上的改善不构成独立证明。</p>`}
   </div>
+  ${done.map(acceptanceTaskCard).join("")}
   ${reps.reports.length ? await renderReportDetail(reps.reports[0].id) : ""}
   <div class="card">
     <b>使用与继续优化</b>
@@ -1272,9 +1432,9 @@ async function renderReportDetail(repId) {
   return `
   <div class="card">
     <b>结果报告 ${esc(r.id)}</b> ${decisionPill(r.decision)}
-    <div class="tip" style="margin-top:8px"><b>怎么看这份报告：</b>
+      <div class="tip" style="margin-top:8px"><b>怎么看这份报告：</b>
       先看第 1 节的结论和建议；第 2、3 节回答“你最关心的问题解决了吗、有没有改出新问题”；
-      第 4 节是独立考题上的对照数据；第 6 节可直接复制新提示词。统计术语可悬停查看，也可查「名词解释」。</div>
+      第 4 节是独立考题上的对照数据；最后一节可直接复制新提示词。统计术语可悬停查看，也可查「名词解释」。</div>
     ${nextBox}
     ${(() => {
       const g = r.gates || {};
@@ -1339,8 +1499,36 @@ async function renderReportDetail(repId) {
       <div class="small">${esc(es.optimization_sample?.role || "")}（${es.optimization_sample?.n ?? "-"} 条，不构成独立证明）；
       独立验证（未参与修改的案例）${es.independent?.n ?? "-"} 条，已消耗。
       <div class="muted">${esc(cleanNote(es.note))}</div></div>
+      ${(() => {
+        const d = s.evaluator_evidence?.human_evidence?.review_duration;
+        if (!d) return "";
+        const time = d.seconds == null ? `未完整采集（${d.timed_side_count}/${d.side_count} 侧）`
+          : `${Math.floor(d.seconds / 60)} 分 ${d.seconds % 60} 秒`;
+        return `<div class="tip small"><b>人工评审页面前台停留估算：</b>${esc(time)}。${esc(d.note)}</div>`;
+      })()}
     </div>
-    <div class="report-section"><h2>6. 完整提示词与使用</h2>
+    ${(() => {
+      const u = s.acceptance_usage;
+      if (!u) return "";
+      const roleLabel = {generation:"生成", evaluation:"评价", optimizer:"优化器", reflection:"反思"};
+      const roles = Object.entries(u.by_role || {}).map(([role, v]) =>
+        `<tr><td>${esc(roleLabel[role] || role)}</td><td>${v.attempts}</td><td>${v.settled}</td><td>${v.failed}</td><td>${v.pending}</td><td>${v.known_tokens}</td></tr>`).join("");
+      const actual = Object.entries(u.actual_cost_estimate_by_currency || {}).map(([c, v]) => `${esc(c)} ${esc(v)}`).join(" · ") || "无已结算金额";
+      const reserved = Object.entries(u.reserved_cost_upper_bound_by_currency || {}).map(([c, v]) => `${esc(c)} ${esc(v)}`).join(" · ") || "无金额预留";
+      return `<div class="report-section"><h2>6. 独立验收消耗</h2>
+        <div class="stat-grid">
+          ${stat("物理请求尝试", u.physical_attempts)}
+          ${stat("已结算 / 失败 / 未确认", `${u.settled_attempts} / ${u.failed_attempts} / ${u.pending_attempts}`)}
+          ${stat("已知 tokens", u.known_tokens)}
+          ${stat("未确认 token 预留", u.unknown_token_reservation)}
+        </div>
+        <div class="small muted">按角色统计（账本记录的物理尝试）：</div>
+        <table><tr><th>角色</th><th>尝试</th><th>已结算</th><th>失败</th><th>未确认</th><th>已知 tokens</th></tr>${roles || '<tr><td colspan="6">无调用记录</td></tr>'}</table>
+        <div class="small">已结算费用估算：${actual}<br>未确认费用预留上界：${reserved}</div>
+        <div class="small muted">${esc(u.cost_basis)}${u.unpriced_settled_attempts ? ` 已结算但缺少冻结价格的尝试：${u.unpriced_settled_attempts} 次。` : ""}</div>
+      </div>`;
+    })()}
+    <div class="report-section"><h2>7. 完整提示词与使用</h2>
       ${promptBlock}
     </div>
   </div>`;
@@ -1378,10 +1566,145 @@ function exportReport(repId) {
 async function acceptRun() {
   const rid = document.getElementById("acc-run").value;
   if (!rid) { toast("暂无可验收的运行：先完成优化并锁定候选", true); return; }
+  await continueExam(rid);
+}
+
+async function continueExam(rid) {
+  const originalHash = location.hash;
+  // Keep the task and stop control visible while the synchronous request runs.
+  const timer = setInterval(() => {
+    if (location.hash === originalHash) route();
+  }, 1000);
+  try { const report = await api("POST", `/runs/${rid}/accept`); toast(report.state === 'waiting_human' ? "整批输出已生成，请完成逐侧人工盲评" : "独立验证完成：" + report.decision); }
+  catch (e) { toast(errText(e), true); }
+  finally { clearInterval(timer); }
+  await route();
+}
+
+async function cancelExam(rid) {
+  try { await api("POST", `/runs/${rid}/acceptance-job/cancel`); toast("已请求停止考试，考题暴露记录保留"); }
+  catch (e) { toast(errText(e), true); }
+  await route();
+}
+
+async function pageHumanExam(rid) {
+  const review = await api('GET', `/runs/${rid}/acceptance-review`);
+  window._humanExam = {rid, review};
+  startHumanReviewTimer(rid);
+  const choose = (id) => `<select id="${id}"><option value="unknown">无法判断</option><option value="yes">是</option><option value="no">否</option></select>`;
+  setMain(`<h1>独立考试：人工最终盲评</h1>
+    <p>分别判断两侧输出。所有评审完成前隐藏版本身份；提交后锁定，刷新可继续。</p>
+    <p id="human-review-time" class="small muted">浏览器前台停留估算：0 秒（不等于净工时）</p>
+    <div class="card"><label>评审人</label><input id="human-reviewer" placeholder="填写姓名或可追溯身份">
+    <details><summary>本场冻结的任务合同与完整评分标准</summary><pre>${esc(JSON.stringify({contract:review.contract, rubric:review.rubric}, null, 2))}</pre></details></div>
+    ${review.pairs.map((pair, index) => `<div class="card"><h2>第 ${index + 1} 组</h2>
+      <details open><summary>实际输入与评价参考</summary><pre>${esc(JSON.stringify({input:pair.task_input, reference:pair.reference}, null, 2))}</pre></details>
+      <div class="grid2">${['A','B'].map(side => { const data = pair.sides[side], id = `human-${index}-${side}`;
+        return `<div><h3>输出 ${side}</h3><pre>${esc(data.text)}</pre><p class="small">生成状态：${esc(data.generation_status)}</p>
+        ${data.submitted ? '<p>已提交并锁定</p>' : `<label>是否达到任务的可用标准</label>${choose(id+'-usable')}
+          <label>是否存在严重错误</label>${choose(id+'-severe')}
+          <label>判断依据（必填）</label><textarea id="${id}-reason"></textarea>
+          <label>问题类别（逗号分隔，可留空）</label><input id="${id}-categories">
+          <label>严重问题对应的规则</label><select id="${id}-rule"><option value="">请选择</option>${Object.entries(review.severity_rules).map(([key,description]) => `<option value="${esc(key)}">${esc(description)}</option>`).join('')}</select>
+          <label>输出原文证据（严重错误为“是”时必填）</label><textarea id="${id}-quote"></textarea>
+          <button onclick="submitHumanExam(${index},'${side}')">确认并锁定输出 ${side} 的评审</button>`}</div>`;
+      }).join('')}</div></div>`).join('')}
+    <button ${review.complete ? '' : 'disabled'} onclick="finishHumanExam()">全部评审已提交，汇总独立验收报告</button>
+    <a href="#/proj/${state.pid}/run/${rid}">返回运行</a>`);
+}
+
+function startHumanReviewTimer(rid) {
+  if (window._humanReviewTimer?.rid === rid) return window._humanReviewTimer;
+  if (window._humanReviewTimer?.interval) clearInterval(window._humanReviewTimer.interval);
+  if (window._humanReviewTimer?.visibilityHandler)
+    document.removeEventListener('visibilitychange', window._humanReviewTimer.visibilityHandler);
+  const key = `prompt-lab-human-review-time:${rid}`;
+  let seconds = 0;
   try {
-    const r = await api("POST", `/runs/${rid}/accept`);
-    toast("独立验证完成：" + r.decision);
-    route();
+    const saved = JSON.parse(localStorage.getItem(key) || '{}');
+    if (Number.isFinite(saved.seconds) && saved.seconds >= 0 && saved.seconds <= 6 * 60 * 60) seconds = saved.seconds;
+  } catch (_) {}
+  const timer = {rid, key, seconds, lastTick: performance.now(), interval: null};
+  const tick = () => {
+    const now = performance.now();
+    const elapsed = now - timer.lastTick;
+    const active = document.visibilityState === 'visible' && document.hasFocus() &&
+      location.hash === `#/proj/${state.pid}/review/${rid}`;
+    // Drop long event-loop stalls instead of counting a suspended browser as review time.
+    if (active && elapsed >= 0 && elapsed <= 5000) timer.seconds += elapsed / 1000;
+    timer.lastTick = now;
+    timer.seconds = Math.min(timer.seconds, 6 * 60 * 60);
+    try { localStorage.setItem(key, JSON.stringify({seconds: timer.seconds})); } catch (_) {}
+    const display = document.getElementById('human-review-time');
+    if (display) display.textContent = `浏览器前台停留估算：${Math.floor(timer.seconds)} 秒（不等于净工时）`;
+  };
+  timer.tick = tick;
+  timer.visibilityHandler = tick;
+  timer.interval = setInterval(tick, 1000);
+  document.addEventListener('visibilitychange', timer.visibilityHandler);
+  window._humanReviewTimer = timer;
+  return timer;
+}
+
+function humanReviewElapsedSeconds(rid) {
+  const timer = startHumanReviewTimer(rid);
+  timer.tick();
+  return Math.min(6 * 60 * 60, Math.floor(timer.seconds));
+}
+
+function stopHumanReviewTimer(rid) {
+  const timer = window._humanReviewTimer;
+  if (!timer || timer.rid !== rid) return;
+  timer.tick();
+  clearInterval(timer.interval);
+  document.removeEventListener('visibilitychange', timer.visibilityHandler);
+  window._humanReviewTimer = null;
+}
+
+async function submitHumanExam(index, side) {
+  const {rid, review} = window._humanExam;
+  const pair = review.pairs[index], output = pair.sides[side], id = `human-${index}-${side}`;
+  const value = suffix => document.getElementById(id + '-' + suffix).value;
+  const tri = v => v === 'yes' ? true : v === 'no' ? false : null;
+  const quote = value('quote'), position = output.text.indexOf(quote);
+  const evidence = [];
+  if (quote) {
+    if (position < 0) { toast('原文证据必须与输出中的文字完全一致', true); return; }
+    const start = Array.from(output.text.slice(0, position)).length;
+    evidence.push({rule_id:value('rule'), quote, start, end:start + Array.from(quote).length});
+  }
+  const reviewer = document.getElementById('human-reviewer').value;
+  try {
+    await api('POST', `/runs/${rid}/acceptance-review/${pair.public_id}/${side}`, {
+      context_hash:review.context_hash, output_hash:output.output_hash,
+      usable:tri(value('usable')), severe:tri(value('severe')), reviewer, reason:value('reason'),
+      categories:value('categories').split(/[,，]/).map(s=>s.trim()).filter(Boolean), evidence,
+      review_elapsed_seconds:humanReviewElapsedSeconds(rid)});
+    toast('评审已提交并锁定');
+    await pageHumanExam(rid);
+    document.getElementById('human-reviewer').value = reviewer;
+  } catch (error) { toast(errText(error), true); }
+}
+
+async function finishHumanExam() {
+  const {rid} = window._humanExam;
+  stopHumanReviewTimer(rid);
+  try {
+    const report = await api('POST', `/runs/${rid}/accept`);
+    if (report.state === 'waiting_human') { await pageHumanExam(rid); return; }
+    toast('人工独立验收完成：' + report.decision);
+    location.hash = `#/proj/${state.pid}/verify`;
+  } catch (error) { toast(errText(error), true); }
+}
+
+async function increaseExamBudget(rid, revision) {
+  try {
+    const limits = {};
+    for (const key of ["total_limit", "search_limit", "acceptance_limit"]) {
+      limits[key] = document.getElementById(`exam-${rid}-${key}`).value.trim();
+    }
+    await api("PATCH", `/runs/${rid}/budget`, {revision, limits});
+    await continueExam(rid);
   } catch (e) { toast(errText(e), true); }
 }
 
@@ -1515,8 +1838,12 @@ async function publishRubric(rid) {
 PAGES.annotation = async (p) => {
   advIntro("这里做人工盲评：两份输出匿名对比，支持判“相当 / 都不可用 / 无法判断”，用于校准评价或复核争议。")
   const outs = await api("GET", `/projects/${p.id}/outputs?limit=200`);
+  const rubrics=await api('GET',`/projects/${p.id}/rubrics`);
+  const golds=await api('GET',`/projects/${p.id}/annotations?gold_only=true`);
   const opts = outs.outputs.map(o =>
     `<option value="${o.id}">${o.id.slice(0, 14)}…（运行 ${esc((o.run_id || "").slice(0, 14))}，状态 ${esc(o.status)}）</option>`).join("");
+  const adjudicationOptions=golds.annotations.filter(a=>a.source==='human_severity' && !a.superseded && a.payload?.severity_gold)
+    .map(a=>`<option value="${esc(a.id)}">${esc(a.id.slice(0,18))}…（${esc(a.payload.severity_gold.reviewer)}，${esc(a.gold_status)}）</option>`).join('');
   return `
   ${advIntro("这里做人工盲评：两份输出匿名对比，支持判“相当 / 都不可用 / 无法判断”，用于校准评价或复核争议。")}
   <div class="card"><b>创建匿名 A/B 对比</b>
@@ -1532,8 +1859,125 @@ PAGES.annotation = async (p) => {
       <input id="blind-id" placeholder="pair_xxxxxxxx"></div>
       <div style="flex:0"><button class="ghost" onclick="loadBlind()">载入盲评</button></div></div>
     <div id="blind-area"></div>
+  </div>
+  <div class="card"><b>人工严重错误金标</b>
+    <p>请逐规则核对完整任务。正例须引用原文；不能判断时保留unknown。未完成考试的盲评输出不能用于此处。</p>
+    <label>输出<select id="severity-gold-output" onchange="invalidateSeverityGold()">${opts}</select></label>
+    <label>已发布标准<select id="severity-gold-rubric" onchange="invalidateSeverityGold()">${rubrics.rubrics.filter(r=>r.status==='published').map(r=>`<option value="${esc(r.id)}">v${r.version_no}</option>`).join('')}</select></label>
+    <button onclick="loadSeverityGold()">加载完整金标上下文</button>
+    <div class="card mt"><b>仲裁已确认的金标</b><p class="small muted">由不同审核人复核并生成新记录；原标注保留但不能继续用于新审计。</p>
+      <label>待仲裁金标<select id="severity-adjudication-target">${adjudicationOptions || '<option value="">没有可仲裁金标</option>'}</select></label>
+      <button id="severity-adjudicate-load" onclick="loadSeverityGoldForAdjudication()" ${adjudicationOptions?'':'disabled'}>载入金标并仲裁</button></div>
+    <div id="severity-gold-area"></div>
   </div>`;
 };
+let severityGoldContext=null;
+let severityGoldLoadRevision=0;
+let severityGoldAdjudicationId=null;
+function invalidateSeverityGold() {
+  severityGoldContext=null;
+  severityGoldAdjudicationId=null;
+  severityGoldLoadRevision++;
+  const area=document.getElementById('severity-gold-area');
+  if(area) area.textContent='选择已变化，请重新加载完整上下文。';
+}
+async function loadSeverityGold() {
+  const revision=++severityGoldLoadRevision;
+  severityGoldContext=null;
+  severityGoldAdjudicationId=null;
+  const area=document.getElementById('severity-gold-area');
+  area.innerHTML='';
+  try {
+    const output=document.getElementById('severity-gold-output').value;
+    const rubric=document.getElementById('severity-gold-rubric').value;
+    const ctx=await api('GET',`/projects/${state.pid}/severity-gold/context?output_id=${encodeURIComponent(output)}&rubric_id=${encodeURIComponent(rubric)}`);
+    if(revision!==severityGoldLoadRevision || document.getElementById('severity-gold-output')?.value!==output || document.getElementById('severity-gold-rubric')?.value!==rubric) return;
+    severityGoldContext=ctx;
+    renderSeverityGoldForm(ctx,null);
+  } catch(e) { toast(errText(e),true); }
+}
+async function loadSeverityGoldForAdjudication() {
+  const revision=++severityGoldLoadRevision;
+  severityGoldContext=null;
+  const area=document.getElementById('severity-gold-area');
+  area.innerHTML='';
+  const aid=document.getElementById('severity-adjudication-target')?.value;
+  if(!aid) { toast('先选择一条待仲裁金标',true); return; }
+  try {
+    const ctx=await api('GET',`/projects/${state.pid}/severity-gold/${encodeURIComponent(aid)}/adjudication-context`);
+    if(revision!==severityGoldLoadRevision || document.getElementById('severity-adjudication-target')?.value!==aid) return;
+    document.getElementById('severity-gold-output').value=ctx.output_id;
+    document.getElementById('severity-gold-rubric').value=ctx.rubric_id;
+    severityGoldContext=ctx;
+    severityGoldAdjudicationId=aid;
+    renderSeverityGoldForm(ctx,ctx.current_gold);
+  } catch(e) { toast(errText(e),true); }
+}
+function renderSeverityGoldForm(ctx,previous) {
+  const area=document.getElementById('severity-gold-area');
+  const initialLabels=previous?.labels || {};
+  const initialEvidence=previous?.evidence || [];
+  area.innerHTML=`<label>任务输入与参考<pre>${esc(JSON.stringify(ctx.task,null,2))}</pre></label>
+    <label>原始输出<pre>${esc(ctx.text)}</pre></label>
+    ${Object.entries(ctx.rules).map(([id,description],index)=>{
+      const value=initialLabels[id]===true?'true':initialLabels[id]===false?'false':'unknown';
+      const ev=initialEvidence.find(item=>item.rule_id===id);
+      return `<div class="card"><b>${esc(description)}</b>
+        <select id="severity-label-${index}"><option value="unknown" ${value==='unknown'?'selected':''}>无法判断</option><option value="false" ${value==='false'?'selected':''}>未违反</option><option value="true" ${value==='true'?'selected':''}>违反</option></select>
+        <label>违规原文引用<input id="severity-quote-${index}" value="${esc(ev?.quote || '')}"></label>
+        <label>引用开始位置（Unicode码点，重复原文时必填）<input id="severity-start-${index}" type="number" min="0" step="1" value="${ev?.start ?? ''}"></label></div>`;
+    }).join('')}
+    <label>仲裁人 / 审核人<input id="severity-gold-reviewer"></label><label>仲裁理由<input id="severity-gold-reason"></label>
+    <label><input id="severity-gold-confirm" type="checkbox">已人工核对输入、参考及完整输出</label>
+    <button onclick="submitSeverityGold(this)">${previous?'保存新的仲裁记录':'保存不可覆盖的人工严重金标'}</button><pre id="severity-gold-result"></pre>`;
+}
+async function submitSeverityGold(button) {
+  button.disabled=true;
+  try {
+    const ctx=severityGoldContext;
+    const supersededId=severityGoldAdjudicationId;
+    if (!ctx) throw new Error('请先加载上下文');
+    if(document.getElementById('severity-gold-output').value!==ctx.output_id || document.getElementById('severity-gold-rubric').value!==ctx.rubric_id) throw new Error('选择已变化，请重新加载上下文');
+    const labels={},evidence=[],chars=Array.from(ctx.text);
+    Object.keys(ctx.rules).forEach((rule,index)=>{
+      const value=document.getElementById(`severity-label-${index}`).value;
+      labels[rule]=value==='unknown'?null:value==='true';
+      if (value==='true') {
+        const quote=document.getElementById(`severity-quote-${index}`).value;
+        const raw=document.getElementById(`severity-start-${index}`).value.trim();
+        const matches=[];
+        for(let start=0;start<chars.length;start++) if(quote && chars.slice(start,start+Array.from(quote).length).join('')===quote) matches.push(start);
+        const start=raw==='' && matches.length===1 ? matches[0] : Number(raw);
+        if(!quote || raw==='' && matches.length!==1 || !Number.isInteger(start) || start<0 || chars.slice(start,start+Array.from(quote).length).join('')!==quote) throw new Error('正例须提供可定位原文；重复引用请明确开始位置');
+        evidence.push({rule_id:rule,start,end:start+Array.from(quote).length,quote});
+      }
+    });
+    const reviewer=document.getElementById('severity-gold-reviewer').value.trim();
+    const reason=document.getElementById('severity-gold-reason').value.trim();
+    const confirmed=document.getElementById('severity-gold-confirm').checked;
+    if(!reviewer || !reason || !confirmed) throw new Error('请具名填写原因并确认人工核验');
+    const path=severityGoldAdjudicationId
+      ? `/projects/${state.pid}/severity-gold/${encodeURIComponent(severityGoldAdjudicationId)}/adjudicate`
+      : `/projects/${state.pid}/severity-gold`;
+    const result=await api('POST',path,{
+      output_id:ctx.output_id,rubric_id:ctx.rubric_id,output_hash:ctx.output_hash,rubric_hash:ctx.rubric_hash,case_hash:ctx.case_hash,
+      labels,evidence,reviewer,reason,confirmed_human_review:confirmed});
+    document.getElementById('severity-gold-result').textContent=supersededId
+      ? `仲裁ID：${result.id}；替代原记录 ${result.supersedes_id}。原金标保留，今后新审计必须使用仲裁结果。`
+      : `金标ID：${result.id}；已锁定保存。可用于审计任务绑定。`;
+    const target=document.getElementById('severity-adjudication-target');
+    if(supersededId && target) Array.from(target.options).find(option=>option.value===supersededId)?.remove();
+    if(target && !Array.from(target.options).some(option=>option.value===result.id)) {
+      target.add(new Option(`${result.id.slice(0,18)}…（最新人工结论）`,result.id));
+    }
+    if(target) target.value=result.id;
+    const loadAdjudication=document.getElementById('severity-adjudicate-load');
+    if(loadAdjudication && target?.options.length) loadAdjudication.disabled=false;
+    toast(supersededId?'人工严重金标仲裁已保存':'人工严重金标已保存');
+    severityGoldAdjudicationId=null;
+  } catch(e) { toast(errText(e),true); }
+  finally { button.disabled=false; }
+}
 async function createPair() {
   const l = document.getElementById("pair-left").value, r = document.getElementById("pair-right").value;
   if (!l || !r) { toast("需要至少两个已存在的输出（先试运行或运行实验）", true); return; }
@@ -1581,6 +2025,13 @@ PAGES.judge = async (p) => {
   const rubOpts = rs.rubrics.filter(r => r.status === "published")
     .map(r => `<option value="${r.id}">v${r.version_no} ${r.id.slice(0, 10)}…</option>`).join("");
   const connOpts = conns.connections.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+  const audits = (await Promise.all(js.judges.map(j => api('GET', `/judges/${j.id}/severity-audits`))))
+    .flatMap(result => result.tasks);
+  const auditCards=await Promise.all(audits.map(async task=>severityAuditCard(task)+await usageReconciliationCard(task.id,'severity-audits')));
+  audits.filter(task=>task.state==='running').forEach(task=>setTimeout(()=>{
+    if(document.getElementById(`severity-${task.id}`)) pollSeverityAudit(task.id);
+  },0));
+  const judgeOpts=js.judges.map(j=>`<option value="${esc(j.id)}">评价器 v${j.version_no} · ${esc(j.status)}</option>`).join('');
   const rows = js.judges.map(j => `
     <tr><td>v${j.version_no}</td><td>${pill(j.status, j.status === "audited" ? "ok" :
       j.status === "stale" ? "bad" : "warn")}</td>
@@ -1595,7 +2046,21 @@ PAGES.judge = async (p) => {
       <div style="flex:0"><button onclick="createJudge()">创建</button></div>
     </div>
   </div>
+  <div class="card"><b>创建时冻结的准入门槛</b>
+    <p class="small">请按业务要求填写，未设置的门槛不能取得准入。样本数量与可靠性要求须由业务确定。</p>
+    <label>评分审计最少来源数<input id="jdg-min-groups" type="number" min="5" step="1"></label>
+    <label>评分完全一致率下限（0–1）<input id="jdg-exact" type="number" min="0" max="1" step="any"></label>
+    <label>评分弃权率上限（0–1）<input id="jdg-abstain" type="number" min="0" max="1" step="any"></label>
+    <label>每条严重规则最少正例来源<input id="sev-positive" type="number" min="1" step="1"></label>
+    <label>每条严重规则最少负例来源<input id="sev-negative" type="number" min="1" step="1"></label>
+    <label>严重检测召回率置信下界要求（0–1）<input id="sev-recall" type="number" min="0" max="1" step="any"></label>
+    <label>严重检测误报率置信上界要求（0–1）<input id="sev-false-positive" type="number" min="0" max="1" step="any"></label>
+    <label>严重检测unknown比例上限（0–1）<input id="sev-unknown" type="number" min="0" max="1" step="any"></label>
+    <label>严重审计置信水平（大于0.5、小于1）<input id="sev-confidence" type="number" min="0.500001" max="0.999999" step="any"></label>
+    <label><input id="sev-simultaneous" type="checkbox">同时保护所有严重规则的统计置信度</label>
+  </div>
   <div class="card"><b>校准（构建集与审计集必须来自不同来源）</b>
+    <label>本次校准的评价器<select id="jdg-selected">${judgeOpts}</select></label>
     <label>构建集输出ID（每行一个，需人工核验gold）</label><textarea id="jdg-build" placeholder="out_..."></textarea>
     <label>审计集输出ID（独立来源，每行一个）</label><textarea id="jdg-audit"></textarea>
     <div style="margin-top:8px"><button onclick="calibrateJudge()">运行校准</button></div>
@@ -1603,23 +2068,154 @@ PAGES.judge = async (p) => {
   </div>
   <div class="card"><b>评价器列表</b>
     <table><tr><th>版本</th><th>状态</th><th>规模</th><th>指标</th></tr>${rows}</table>
+  </div>
+  <div class="card"><b>严重错误检测审计任务</b>
+    <label>评价器<select id="sev-judge">${judgeOpts}</select></label>
+    <label>构建集人工严重金标ID（每行一个）<textarea id="sev-build"></textarea></label>
+    <label>独立审计人工严重金标ID（每行一个，来源不能与构建集重叠）<textarea id="sev-audit"></textarea></label>
+    <label>预算单位<select id="sev-budget-mode"><option value="token">token</option><option value="money">金额（需已核实单价）</option></select></label>
+    <label>总额度<input id="sev-total-limit"></label><label>审计额度<input id="sev-search-limit"></label>
+    <button onclick="createSeverityAudit(this)">绑定审计任务（不调用模型）</button>
+    <p class="small">统计通过后还须核验原始证据和评分准入，再由具名审核人激活。停止不能撤回已发送请求，未知费用会继续保留。</p>
+    ${audits.length ? auditCards.join('') : '<p>暂无已绑定任务。</p>'}
   </div>`;
 };
+
+function severityAuditCard(task) {
+  const aid = task.id, budget = task.budget;
+  const resumable = ['bound', 'paused_budget', 'paused_interrupted'].includes(task.state);
+  const labels = {bound:'待执行',running:'执行中',paused_budget:'预算暂停',paused_interrupted:'中断暂停',completed:'已完成',cancelled:'已停止'};
+  return `<section class="card" id="severity-${esc(aid)}" data-revision="${task.revision}" data-acceptance-limit="${esc(budget.acceptance_limit)}">
+    <b>${esc(labels[task.state] || task.state)}</b> · 构建 ${task.build_count} / 独立审计 ${task.audit_count} / 规则 ${task.rule_count}
+    <p class="small">任务 ${esc(aid)} · ${esc(task.error)}</p>
+    <p>预算单位：${esc(budget.mode === 'money' ? Object.values(budget.prices)[0]?.currency || '金额' : 'token')}；已发生 ${esc(budget.spent.search)}；费用保留 ${esc(budget.reserved.search)}</p>
+    <label>总额度<input data-field="total_limit" value="${esc(budget.total_limit)}" ${task.state !== 'paused_budget' ? 'disabled' : ''}></label>
+    <label>审计额度<input data-field="search_limit" value="${esc(budget.search_limit)}" ${task.state !== 'paused_budget' ? 'disabled' : ''}></label>
+    <label>审核人<input data-field="reviewer" autocomplete="name"></label>
+    <label>操作原因<input data-field="reason"></label>
+    <div class="flex">
+      ${resumable ? `<button onclick="severityAuditAction('${aid}','execute',this)">执行 / 继续</button>` : ''}
+      ${task.state === 'paused_budget' ? `<button onclick="severityAuditAction('${aid}','budget',this)">增加预算</button>` : ''}
+      ${!['completed','cancelled'].includes(task.state) ? `<button onclick="severityAuditAction('${aid}','cancel',this)">停止</button>` : ''}
+      ${task.state === 'completed' ? `<button onclick="severityAuditAction('${aid}','verify-evidence',this)">核验完整证据</button><button onclick="severityAuditAction('${aid}','activate',this)">正式激活检测器</button>` : ''}
+    </div>
+    ${task.metrics.audit ? `<p>独立审计统计：${task.metrics.audit.eligible ? '达到冻结门槛' : '未达到冻结门槛'}；激活需另行核验。</p>` : ''}
+  </section>`;
+}
+
+async function severityAuditAction(aid, action, button) {
+  const card = document.getElementById(`severity-${aid}`);
+  const field = key => card.querySelector(`[data-field="${key}"]`).value.trim();
+  const revision = Number(card.dataset.revision);
+  button.disabled = true;
+  try {
+    let body;
+    if (action === 'activate' || action === 'cancel') {
+      if (!field('reason') || (action === 'activate' && !field('reviewer'))) throw new Error('请填写操作原因；激活还须填写审核人。');
+      body = {revision, reason:field('reason'), ...(action === 'activate' ? {reviewer:field('reviewer')} : {})};
+    } else if (action === 'budget') {
+      body = {revision, limits:{total_limit:field('total_limit'),search_limit:field('search_limit'),acceptance_limit:card.dataset.acceptanceLimit}};
+    }
+    const result = await api('POST', `/severity-audits/${aid}/${action === 'execute' ? 'dispatch' : action}`, body);
+    toast(action === 'verify-evidence' ? `证据有效；统计${result.statistically_eligible ? '通过' : '未通过'}，核验不会自动激活。` : '操作已保存');
+    if (action !== 'verify-evidence') await route();
+    if (action === 'execute') pollSeverityAudit(aid);
+  } catch (e) {
+    toast(errText(e), true);
+    if (action === 'execute') await route();
+  }
+  finally { button.disabled = false; }
+}
+
+const severityAuditPolls=new Map();
+async function refreshSeverityPagePreservingDrafts() {
+  const hash=location.hash;
+  const drafts=Array.from(document.querySelectorAll('input,textarea,select')).filter(element=>
+    !element.disabled && (element.id || element.closest('[id^="severity-"]'))).map(element=>({
+      id:element.id,card:element.closest('[id^="severity-"]')?.id,field:element.dataset.field,
+      value:element.value,checked:element.checked,type:element.type}));
+  const track=event=>{
+    const element=event.target;
+    const draft=drafts.find(item=>item.id ? item.id===element.id :
+      item.card===element.closest?.('[id^="severity-"]')?.id && item.field===element.dataset?.field);
+    if(draft) { draft.value=element.value; draft.checked=element.checked; }
+  };
+  document.addEventListener('input',track);
+  document.addEventListener('change',track);
+  try { await route(); }
+  finally {
+    document.removeEventListener('input',track);
+    document.removeEventListener('change',track);
+  }
+  if(location.hash!==hash) return;
+  for(const draft of drafts) {
+    const element=draft.id ? document.getElementById(draft.id) :
+      document.getElementById(draft.card)?.querySelector(`[data-field="${draft.field}"]`);
+    if(!element || element.disabled) continue;
+    if(draft.type==='checkbox') element.checked=draft.checked;
+    else if(element.tagName!=='SELECT' || Array.from(element.options).some(option=>option.value===draft.value)) element.value=draft.value;
+  }
+}
+async function pollSeverityAudit(aid) {
+  if(severityAuditPolls.has(aid)) return;
+  const pageHash=location.hash;
+  severityAuditPolls.set(aid,true);
+  try {
+    let previous=null;
+    while(location.hash===pageHash && document.getElementById(`severity-${aid}`)) {
+      const task=await api('GET',`/severity-audits/${aid}`);
+      if(task.revision!==previous) {
+        previous=task.revision;
+        await refreshSeverityPagePreservingDrafts();
+      }
+      if(!['bound','running'].includes(task.state)) break;
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+  } catch(e) { toast(errText(e),true); }
+  finally { severityAuditPolls.delete(aid); }
+}
 async function createJudge() {
+  const readPolicy = (mapping) => {
+    const values=Object.entries(mapping).map(([key,id])=>[key,document.getElementById(id).value.trim()]);
+    if (values.every(([,value])=>value==='')) return null;
+    if (values.some(([,value])=>value==='' || !Number.isFinite(Number(value)))) throw new Error('一组准入门槛须全部填写为有限数值。');
+    return Object.fromEntries(values.map(([key,value])=>[key,Number(value)]));
+  };
+  try {
+  const score=readPolicy({min_groups:'jdg-min-groups',min_exact_rate:'jdg-exact',max_abstain_rate:'jdg-abstain'});
+  const severe=readPolicy({min_positive_groups:'sev-positive',min_negative_groups:'sev-negative',min_recall_lower:'sev-recall',max_false_positive_upper:'sev-false-positive',max_unknown_rate:'sev-unknown',confidence:'sev-confidence'});
   const r = await api("POST", `/projects/${state.pid}/judges`, {
     rubric_id: document.getElementById("jdg-rubric").value,
-    model_cfg: { connection_id: document.getElementById("jdg-conn").value } });
+    model_cfg: { connection_id: document.getElementById("jdg-conn").value,
+      ...(score ? {calibration_policy:score} : {}),
+      ...(severe ? {severity_calibration_policy:{...severe,simultaneous:document.getElementById('sev-simultaneous').checked}} : {})} });
   toast("评价器已创建：" + r.id);
   route();
+  } catch (e) { toast(errText(e),true); }
+}
+async function createSeverityAudit(button) {
+  button.disabled=true;
+  try {
+    const jid=document.getElementById('sev-judge').value;
+    if (!jid) throw new Error('请先选择评价器。');
+    await api('POST',`/judges/${jid}/severity-audits`,{
+      build_gold_ids:linesToIds('sev-build'),audit_gold_ids:linesToIds('sev-audit'),
+      budget:{mode:document.getElementById('sev-budget-mode').value,
+              total_limit:document.getElementById('sev-total-limit').value.trim(),
+              search_limit:document.getElementById('sev-search-limit').value.trim(),acceptance_limit:0}});
+    toast('任务已绑定，尚未发送模型请求');
+    await route();
+  } catch(e) { toast(errText(e),true); }
+  finally { button.disabled=false; }
 }
 function linesToIds(id) {
   return document.getElementById(id).value.split("\n").map(s => s.trim()).filter(Boolean);
 }
 async function calibrateJudge() {
-  const js = await api("GET", `/projects/${state.pid}/judges`);
-  const j = js.judges[js.judges.length - 1];
   try {
-    const r = await api("POST", `/judges/${j.id}/calibrate`,
+    const jid=document.getElementById('jdg-selected').value;
+    if (!jid) throw new Error('请先选择评价器。');
+    const r = await api("POST", `/judges/${jid}/calibrate`,
       { build_refs: linesToIds("jdg-build"), audit_refs: linesToIds("jdg-audit") });
     const out = document.getElementById("jdg-out");
     out.classList.remove("hidden");
@@ -1720,10 +2316,10 @@ async function diffPrompt() {
 /* ---------------- 高级功能：实验配置 ---------------- */
 PAGES.experiment = async (p) => {
   advIntro("高级启动入口：完整配置快照、分阶段预算与批量模式。常规使用建议走左侧五步流程。")
-  const [ps, mans, rs, js, conns] = await Promise.all([
+  const [ps, mans, rs, js, conns, prices] = await Promise.all([
     api("GET", `/projects/${p.id}/prompts`), api("GET", `/projects/${p.id}/manifests`),
     api("GET", `/projects/${p.id}/rubrics`), api("GET", `/projects/${p.id}/judges`),
-    api("GET", "/settings/connections")]);
+    api("GET", "/settings/connections"), api("GET", "/settings/prices")]);
   const devItems = await api("GET", `/projects/${p.id}/items?split=dev&size=100`);
   const selItems = await api("GET", `/projects/${p.id}/items?split=select&size=100`);
   const pvOpts = ps.prompts.map(v => `<option value="${v.id}">${esc(v.name)} v${v.version_no}</option>`).join("");
@@ -1735,6 +2331,10 @@ PAGES.experiment = async (p) => {
   const connOpts = conns.connections.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
   const devIds = devItems.items.map(i => i.id), selIds = selItems.items.map(i => i.id);
   window._devIds = devIds; window._selIds = selIds;
+  window._budgetConnections = conns.connections;
+  window._budgetPrices = prices.prices;
+  window._budgetMode = "token";
+  window._budgetDrafts = {};
   return `
   ${advIntro("高级启动入口：完整配置快照、分阶段预算与批量模式。常规使用建议走左侧五步流程。")}
   <div class="card"><b>实验配置与启动（高级）</b>
@@ -1743,23 +2343,29 @@ PAGES.experiment = async (p) => {
       <div><label>基线提示词版本</label><select id="ex-pv">${pvOpts}</select></div>
       <div><label>切分清单</label><select id="ex-man">${manOpts}</select></div>
       <div><label>评价标准</label><select id="ex-rubric">${rubOpts}</select></div>
-      <div><label>评价器（批量模式必须已审计）</label><select id="ex-judge">${judgeOpts}</select></div>
+      <div><label>评价器（批量模式必须通过校准准入）</label><select id="ex-judge">${judgeOpts}</select></div>
       <div><label>模式</label><select id="ex-mode"><option value="explore">explore 探索</option>
         <option value="batch">batch 批量</option></select></div>
-      <div><label>生成/评价/优化连接</label><select id="ex-conn">${connOpts}</select></div>
+      <div><label>生成/评价/优化连接</label><select id="ex-conn" onchange="updateBudgetUnit()">${connOpts}</select></div>
       <div><label>优化轮数上限</label><input id="ex-cand" type="number" value="3"></div>
+      <div><label>搜索策略</label><select id="ex-strategy" onchange="updateAdvancedOptimizationStrategy()">
+        <option value="reflection">反思式逐轮优化</option><option value="single">单次反思改写</option>
+        <option value="gepa">GEPA 前沿搜索（可选扩展）</option></select></div>
+      <div><label>GEPA评价调用上限</label><input id="ex-gepa-calls" type="number" min="1" max="10000" value="40" disabled></div>
       <div><label>开发集抽样</label><input id="ex-sample" type="number" value="8"></div>
       <div><label>最小提升阈值</label><input id="ex-delta" type="number" step="0.01" value="0.05"></div>
       <div><label>连续无改善停止（轮）</label><input id="ex-stall" type="number" value="2"></div>
       <div><label>提示词长度上限（字）</label><input id="ex-len" type="number" value="4000"></div>
       <div><label>人工参与模式</label><select id="ex-human"><option value="">自动连续执行</option>
-        <option value="1">每轮等待人工评价</option></select></div>
-      <div><label>预算模式</label><select id="ex-bmode"><option value="token">token</option>
-        <option value="money">money</option></select></div>
-      <div><label>总额度</label><input id="ex-btotal" type="number" value="2000000"></div>
-      <div><label>搜索额度</label><input id="ex-bsearch" type="number" value="1200000"></div>
-      <div><label>验收预留</label><input id="ex-baccept" type="number" value="600000"></div>
+        <option value="1">每轮等待人工评价</option></select><p class="muted small">GEPA目前连续搜索，不支持逐轮人工暂停。</p></div>
+      <div><label>独立考试的最终评价</label><select id="ex-final-eval"><option value="model">模型评价（须独立校准）</option><option value="human">人工逐侧盲评</option></select></div>
+      <div><label>预算模式</label><select id="ex-bmode" onchange="changeBudgetMode()"><option value="token">Token 用量</option>
+        <option value="money">金额估算</option></select></div>
+      <div><label id="ex-total-label" for="ex-btotal">总额度（token）</label><input id="ex-btotal" type="number" min="0" value="2000000"></div>
+      <div><label id="ex-search-label" for="ex-bsearch">搜索额度（token）</label><input id="ex-bsearch" type="number" min="0" value="1200000"></div>
+      <div><label id="ex-accept-label" for="ex-baccept">验收预留（token）</label><input id="ex-baccept" type="number" min="0" value="600000"></div>
     </div>
+    <p id="ex-budget-help" class="small muted">Token额度包含输入与输出；在途和费用未知请求会保留预留。</p>
     <div class="small muted" style="margin-top:6px">开发集 ${devIds.length} 条 / 选择集 ${selIds.length} 条将按快照写入</div>
     <div style="margin-top:10px">
       <button class="ghost" onclick="validateRun()">校验并预估</button>
@@ -1768,6 +2374,39 @@ PAGES.experiment = async (p) => {
     <pre id="ex-out" class="hidden"></pre>
   </div>`;
 };
+function updateAdvancedOptimizationStrategy() {
+  const strategy = document.getElementById("ex-strategy").value;
+  const rounds = document.getElementById("ex-cand");
+  rounds.disabled = strategy === "single" || strategy === "gepa";
+  if (strategy === "single") rounds.value = "1";
+  if (strategy === "reflection") rounds.value = "3";
+  const human = document.getElementById("ex-human");
+  human.disabled = strategy === "gepa";
+  if (strategy === "gepa") human.value = "";
+  document.getElementById("ex-gepa-calls").disabled = strategy !== "gepa";
+}
+function changeBudgetMode() {
+  const ids = ["ex-btotal", "ex-bsearch", "ex-baccept"];
+  const mode = document.getElementById("ex-bmode").value;
+  window._budgetDrafts[window._budgetMode] = ids.map(id => document.getElementById(id).value);
+  const values = window._budgetDrafts[mode] || (mode === "token" ? ["2000000", "1200000", "600000"] : ["", "", "0"]);
+  ids.forEach((id, index) => { document.getElementById(id).value = values[index]; });
+  window._budgetMode = mode;
+  updateBudgetUnit();
+}
+function updateBudgetUnit() {
+  const money = document.getElementById("ex-bmode").value === "money";
+  const connection = (window._budgetConnections || []).find(c => c.id === document.getElementById("ex-conn").value);
+  const price = (window._budgetPrices || {})[connection?.model];
+  const unit = money ? (price?.currency || "先配置单价和币种") : "token";
+  [["ex-total-label", "总额度"], ["ex-search-label", "搜索额度"], ["ex-accept-label", "验收预留"]].forEach(([id, label]) => {
+    document.getElementById(id).textContent = `${label}（${unit}）`;
+  });
+  ["ex-btotal", "ex-bsearch", "ex-baccept"].forEach(id => { document.getElementById(id).step = money ? "any" : "1"; });
+  document.getElementById("ex-budget-help").textContent = money
+    ? `按模型 ${connection?.model || "未选择"} 的单价估算；${price ? "币种 " + unit : "请先在设置页配置输入/输出单价与币种"}。金额由你填写，启动时冻结价格。费用未知保留预留；此处不核验供应商账单或账户余额。`
+    : "Token额度包含输入与输出；在途和费用未知请求会保留预留。";
+}
 function collectDraft() {
   const conn = document.getElementById("ex-conn").value;
   return {
@@ -1776,19 +2415,22 @@ function collectDraft() {
     manifest_id: document.getElementById("ex-man").value,
     rubric_id: document.getElementById("ex-rubric").value,
     judge_id: document.getElementById("ex-judge").value || null,
+    acceptance: { evaluation_source: document.getElementById("ex-final-eval").value },
     data: { dev_item_ids: window._devIds, select_item_ids: window._selIds },
     models: { generation: { connection_id: conn }, evaluation: { connection_id: conn },
               optimizer: { connection_id: conn } },
-    optimization: { max_rounds: +document.getElementById("ex-cand").value,
+    optimization: { strategy: document.getElementById("ex-strategy").value,
+      max_rounds: +document.getElementById("ex-cand").value,
+      gepa_max_metric_calls: +document.getElementById("ex-gepa-calls").value,
       dev_sample_size: +document.getElementById("ex-sample").value,
       min_delta: +document.getElementById("ex-delta").value,
       stall_rounds: +document.getElementById("ex-stall").value,
       length_limit_chars: +document.getElementById("ex-len").value,
       human_in_loop: !!document.getElementById("ex-human").value },
     budget: { mode: document.getElementById("ex-bmode").value,
-      total_limit: +document.getElementById("ex-btotal").value,
-      search_limit: +document.getElementById("ex-bsearch").value,
-      acceptance_limit: +document.getElementById("ex-baccept").value },
+      total_limit: document.getElementById("ex-btotal").value.trim(),
+      search_limit: document.getElementById("ex-bsearch").value.trim(),
+      acceptance_limit: document.getElementById("ex-baccept").value.trim() },
   };
 }
 async function validateRun() {
@@ -1796,7 +2438,8 @@ async function validateRun() {
     const r = await api("POST", `/projects/${state.pid}/runs/validate`, collectDraft());
     document.getElementById("ex-out").classList.remove("hidden");
     document.getElementById("ex-out").textContent =
-      "校验通过。\n" + JSON.stringify(r.estimate, null, 2);
+      "校验通过。\n预算与冻结价格：\n" + JSON.stringify(r.snapshot.budget, null, 2) +
+      "\n调用与人工工作量估算：\n" + JSON.stringify(r.estimate, null, 2);
   } catch (e) {
     document.getElementById("ex-out").classList.remove("hidden");
     document.getElementById("ex-out").textContent = errText(e);
